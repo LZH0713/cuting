@@ -1,0 +1,96 @@
+name: Release
+
+# Pushing a tag `v*` builds the macOS app and publishes a GitHub Release.
+# The updater feed (latest.json) is only produced when the updater signing
+# key is configured (repository secrets):
+#   TAURI_SIGNING_PRIVATE_KEY            contents of ~/.tauri/cuting.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   empty for a key without a password
+# Optional, to keep screen-recording permission across updates:
+#   APPLE_CERTIFICATE_P12                base64 of the Apple Development .p12
+#   APPLE_CERTIFICATE_PASSWORD           the .p12 password
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      CUTING_SIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import the code signing certificate
+        if: env.APPLE_CERTIFICATE_P12 != ''
+        run: |
+          P12=$(mktemp); KEYCHAIN=build.keychain
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$P12"
+          security create-keychain -p "" "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
+          ID=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/App Development|Apple Development|Developer Application/{print $2; exit}')
+          echo "CUTING_SIGN_IDENTITY=$ID" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          BUNDLES="app"
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then BUNDLES="app updater"; fi
+          CONFIG_ARGS=""
+          if [ -n "$CUTING_SIGN_IDENTITY" ]; then
+            CONFIG_ARGS=$(printf -- '--config {"bundle":{"macOS":{"signingIdentity":"%s"}}}' "$CUTING_SIGN_IDENTITY")
+          fi
+          # shellcheck disable=SC2086
+          npm run tauri build -- --bundle $BUNDLES $CONFIG_ARGS
+
+      - name: Sign the bundle (keeps screen-recording permission across updates)
+        if: env.CUTING_SIGN_IDENTITY != ''
+        run: sh src-tauri/scripts/sign-app.sh src-tauri/target/release/bundle/macos/Cuting.app
+
+      - name: Collect artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          cp -R src-tauri/target/release/bundle/macos/Cuting.app release/
+          ditto -c -k --sequesterRsrc --keepParent release/Cuting.app release/Cuting-macOS-arm64.zip
+          if ls src-tauri/target/release/bundle/updater/*.app.tar.gz >/dev/null 2>&1; then
+            cp src-tauri/target/release/bundle/updater/Cuting.app.tar.gz release/
+            cp src-tauri/target/release/bundle/updater/Cuting.app.tar.gz.sig release/
+            URL="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/Cuting.app.tar.gz"
+            jq -n --arg version "$VERSION" --arg url "$URL" --rawfile sig release/Cuting.app.tar.gz.sig --arg notes "$(git log -1 --pretty=%B | sed '/^\s*$/d' | head -n 5)" \
+              '{version: $version, notes: $notes, pub_date: (now | todateiso8601), platforms: { "darwin-aarch64": { signature: $sig, url: $url } } }' > release/latest.json
+            cat release/latest.json
+          else
+            echo "no updater artifacts (configure TAURI_SIGNING_PRIVATE_KEY to enable the update feed)"
+          fi
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FILES=(release/Cuting-macOS-arm64.zip)
+          [ -f release/latest.json ] && FILES+=(release/latest.json release/Cuting.app.tar.gz release/Cuting.app.tar.gz.sig)
+          gh release create "$GITHUB_REF_NAME" --title "Cuting $GITHUB_REF_NAME" --generate-notes "${FILES[@]}"

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for every Cuting window",
+  "windows": ["overlay-*", "result", "settings"],
+  "permissions": ["core:default"]
+}

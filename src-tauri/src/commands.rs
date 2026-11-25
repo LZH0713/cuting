@@ -1,0 +1,439 @@
+//! IPC commands called from the webviews.
+//!
+//! Sync commands run on the main thread, which is where AppKit and the
+//! pasteboard want to be touched. Anything slow (OCR, PNG encoding, network)
+//! lives in an `async` command or is moved to a blocking thread.
+
+use base64::Engine as _;
+use serde::Serialize;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_dialog::DialogExt;
+
+use crate::capture::{self, Frame, IRect};
+use crate::clipboard;
+use crate::clog;
+use crate::geo::Rect;
+use crate::ocr;
+use crate::overlay::{self, Mode};
+use crate::proxy;
+use crate::settings;
+use crate::translate;
+use crate::tray;
+use crate::util::lock;
+use crate::AppState;
+
+/// The frozen frame of the calling overlay, plus the selection in pixels.
+fn selected_frame(app: &AppHandle, label: &str, rect: &Rect) -> Result<(u32, Frame, IRect), String> {
+    let monitor_id = overlay::monitor_id_from_label(label).ok_or("不是截图覆盖层窗口")?;
+    let frame = overlay::frame(app, monitor_id).ok_or("截图会话已结束，请重新截图")?;
+    let px = frame.to_pixels(rect).ok_or("选区太小，请重新框选")?;
+    Ok((monitor_id, frame, px))
+}
+
+// ------------------------------------------------------------------- overlay
+
+/// State for an overlay page. Pulled on mount because a `capture-start` event
+/// sent before the page finished loading would be lost.
+#[tauri::command]
+pub fn overlay_start_payload(window: WebviewWindow, app: AppHandle) -> Option<overlay::StartPayload> {
+    overlay::monitor_id_from_label(window.label()).and_then(|id| overlay::start_payload(&app, id))
+}
+
+/// Which overlay phase the page is in; the native magnifier only follows the
+/// cursor during selection. Cheap: a few calls per session, not per move.
+#[tauri::command]
+pub fn set_overlay_phase(app: AppHandle, phase: String) {
+    overlay::set_magnifier_phase(&app, phase == "select");
+}
+
+/// Close the overlay. `reason` says what triggered it (Esc, the close button,
+/// a right click, …); it only goes to the log, but that is exactly what makes
+/// "why did my screenshot disappear" answerable later.
+#[tauri::command]
+pub fn cancel_capture(app: AppHandle, reason: Option<String>) {
+    clog!("cancel capture ({})", reason.as_deref().unwrap_or("unspecified"));
+    overlay::cancel(&app);
+}
+
+#[tauri::command]
+pub fn copy_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<Value, String> {
+    clog!("copy {rect:?}");
+    let (_, frame, px) = selected_frame(&app, window.label(), &rect)?;
+    let image = frame.crop_image(&px).ok_or("裁剪截图失败")?;
+    let scale = frame.scale();
+    // Clipboard first: if it fails the overlay stays up and the user can retry.
+    // The image keeps its on-screen size, so a Retina shot doesn't paste huge.
+    clipboard::write_image(&image, px.w as f64 / scale, px.h as f64 / scale)?;
+    let previous = overlay::end_session(&app);
+    overlay::restore(&app, previous);
+    clog!("copied {}x{} px ({} pt) to the clipboard", px.w, px.h, px.w as f64 / scale);
+    Ok(json!({ "ok": true, "width": px.w, "height": px.h }))
+}
+
+#[tauri::command]
+pub async fn save_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<Value, String> {
+    clog!("save {rect:?}");
+    let (_, frame, px) = selected_frame(&app, window.label(), &rect)?;
+    let (width, height, scale) = (px.w as u32, px.h as u32, frame.scale());
+    let rgba = frame.crop_rgba(&px);
+    let png = tauri::async_runtime::spawn_blocking(move || capture::encode_png(&rgba, width, height, scale))
+        .await
+        .map_err(|e| e.to_string())??;
+    let previous = overlay::end_session(&app);
+
+    // The save panel belongs to us, so focus goes back to the previous app
+    // only after the panel closes.
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let dir = lock(&handle.state::<AppState>().settings)
+            .save_dir
+            .clone()
+            .filter(|d| !d.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(settings::default_save_dir);
+        let restore_handle = handle.clone();
+        handle
+            .dialog()
+            .file()
+            .set_directory(dir)
+            .set_file_name(format!("截图 {}.png", crate::util::file_stamp()))
+            .add_filter("PNG 图片", &["png"])
+            .save_file(move |path| {
+                overlay::restore(&restore_handle, previous);
+                let Some(path) = path.and_then(|p| p.into_path().ok()) else { return };
+                std::thread::spawn(move || match std::fs::write(&path, &png) {
+                    Ok(()) => clog!("saved {}", path.display()),
+                    Err(e) => clog!("save to {} failed: {e}", path.display()),
+                });
+            });
+    });
+    Ok(json!({ "ok": true }))
+}
+
+// --------------------------------------------------------------- ocr / translate
+
+/// Recognize the selection and show it in the result window. `action` decides
+/// whether the result window also offers a translation right away.
+#[tauri::command]
+pub async fn ocr_region(
+    window: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    rect: Rect,
+    action: String,
+) -> Result<Value, String> {
+    clog!("ocr_region invoked from {}", window.label());
+    let (monitor_id, frame, px) = selected_frame(&app, window.label(), &rect)?;
+    let session_id = overlay::session_id(&app).ok_or("截图会话已结束，请重新截图")?;
+    let image = frame.crop_image(&px).ok_or("裁剪截图失败")?;
+    let langs = lock(&state.settings).ocr_languages.clone();
+    let mode = if action == "translate" { "translate" } else { "ocr" };
+    clog!("ocr region {rect:?} (action {action}, session {session_id})");
+
+    // The overlay stays up (with the busy spinner) until recognition succeeds;
+    // on failure the user can press Esc or redraw the selection.
+    //
+    // macOS 15's Vision service occasionally stops answering, leaving
+    // `performRequests` blocked forever (seen on this very machine). A timeout
+    // turns that into an error on the overlay instead of an endless spinner.
+    // The hung worker thread is abandoned; the process is long-lived, but one
+    // parked thread per total system failure is acceptable.
+    let work = tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let started = crate::util::now_ms();
+        let lines = ocr::recognize(&image, &langs)?;
+        let text = ocr::lines_to_text(&lines);
+        // Preview is capped at ~1200 px on its long side to keep the data URL small.
+        let (w, h) = (px.w as u32, px.h as u32);
+        let factor = (w.max(h) + 1199) / 1200;
+        let (pw, ph, preview) = capture::downscale_rgba(&frame.crop_rgba(&px), w, h, factor);
+        let png = capture::encode_png(&preview, pw, ph, 1.0)?;
+        let image_url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png));
+        let elapsed = crate::util::now_ms() - started;
+        clog!("ocr: {} line(s) in {elapsed} ms", lines.len());
+        Ok(json!({
+            "mode": mode,
+            "image": image_url,
+            "text": text,
+            "lines": lines,
+            "elapsedMs": elapsed,
+            "width": w,
+            "height": h,
+        }))
+    });
+    let joined = match tokio::time::timeout(std::time::Duration::from_secs(20), work).await {
+        Ok(joined) => joined.map_err(|e| e.to_string())?,
+        Err(_) => {
+            clog!("ocr_region: recognition timed out; the system Vision service is not answering");
+            return Err(
+                "文字识别超时：系统的识别服务暂时没有响应（macOS 偶发问题）。请按 Esc 关闭后重试一次；反复出现时重启电脑可恢复。"
+                    .to_string(),
+            );
+        }
+    };
+    let payload = joined?;
+    if overlay::session_id(&app) != Some(session_id) {
+        // The user pressed Esc while recognition was running: don't pop a
+        // result window on top of what they went back to.
+        clog!("recognition finished after the session ended; result dropped");
+        return Ok(json!({ "ok": false, "cancelled": true }));
+    }
+    overlay::end_session(&app);
+    overlay::show_result(&app, payload, Some((monitor_id, rect)));
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+pub async fn translate_text(
+    state: State<'_, AppState>,
+    text: String,
+    target: Option<String>,
+) -> Result<translate::Translation, String> {
+    let settings = lock(&state.settings).clone();
+    let target = target.filter(|t| !t.trim().is_empty()).unwrap_or(settings.target_lang);
+    let client = proxy::client(&settings.proxy)?;
+    translate::translate(&client, &settings.translator, &text, &target, None).await
+}
+
+/// What the release feed offers, if anything.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub version: String,
+    pub notes: Option<String>,
+    pub current_version: String,
+}
+
+/// Ask the GitHub release feed whether a newer version exists.
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|e| format!("更新组件不可用：{e}"))?
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败：{e}"))?;
+    Ok(update.map(|u| UpdateInfo {
+        version: u.version.clone(),
+        notes: u.body.clone(),
+        current_version: u.current_version.clone(),
+    }))
+}
+
+/// Download, install and restart. Only called from the settings window.
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| format!("更新组件不可用：{e}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败：{e}"))?
+        .ok_or_else(|| "当前已是最新版本".to_string())?;
+    clog!("downloading update {}", update.version);
+    update
+        .download_and_install(|received, total| {
+            if let Some(total) = total {
+                clog!("downloaded {received} / {total} bytes");
+            }
+        }, || {})
+        .await
+        .map_err(|e| format!("下载安装失败：{e}"))?;
+    clog!("update {} installed, restarting", update.version);
+    app.restart()
+}
+
+/// Try a proxy configuration the way a translation would use it. Takes the
+/// settings as they are in the form, so it works before saving.
+#[tauri::command]
+pub async fn test_network(proxy: proxy::ProxyConfig) -> Result<proxy::TestReport, String> {
+    proxy::test(&proxy).await
+}
+
+/// Local ports that look like a proxy, to spare the user from typing one.
+#[tauri::command]
+pub async fn detect_local_proxies() -> Vec<u16> {
+    tauri::async_runtime::spawn_blocking(proxy::detect_local_proxies).await.unwrap_or_default()
+}
+
+// -------------------------------------------------------------------- settings
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LangInfo {
+    pub code: &'static str,
+    pub name: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    pub settings: settings::Settings,
+    pub langs: Vec<LangInfo>,
+    pub ocr_languages: Vec<LangInfo>,
+    pub screen_capture_allowed: bool,
+    pub default_save_dir: String,
+    pub log_file: String,
+    pub version: &'static str,
+}
+
+#[tauri::command]
+pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
+    AppInfo {
+        settings: lock(&state.settings).clone(),
+        langs: translate::LANGS.iter().map(|l| LangInfo { code: l.code, name: l.zh }).collect(),
+        ocr_languages: ocr::OCR_LANGUAGES.iter().map(|(code, name)| LangInfo { code, name }).collect(),
+        screen_capture_allowed: capture::screen_capture_allowed(),
+        default_save_dir: settings::default_save_dir().to_string_lossy().into_owned(),
+        log_file: crate::util::log_file_path().to_string_lossy().into_owned(),
+        version: env!("CARGO_PKG_VERSION"),
+    }
+}
+
+/// Keys that type a character when pressed on their own.
+fn types_on_its_own(code: &tauri_plugin_global_shortcut::Code) -> bool {
+    // `Code` has explicit discriminants, so its names are matched as text.
+    let name = format!("{code:?}");
+    let one = |prefix: &str, is: fn(u8) -> bool| name.strip_prefix(prefix).is_some_and(|rest| rest.len() == 1 && rest.bytes().all(is));
+    one("Key", |b| b.is_ascii_uppercase())
+        || one("Digit", |b| b.is_ascii_digit())
+        || one("Numpad", |b| b.is_ascii_digit())
+        || matches!(
+            name.as_str(),
+            "Space" | "Tab" | "Enter" | "NumpadEnter" | "Comma" | "Period" | "Slash" | "Minus" | "Equal" | "Semicolon" | "Quote"
+                | "Backslash" | "Backquote" | "BracketLeft" | "BracketRight" | "IntlRo" | "IntlYen"
+        )
+}
+
+/// Reject a hotkey we can't register before it reaches the settings file.
+fn validate_hotkey(combo: &str) -> Result<(), String> {
+    let shortcut = combo
+        .trim()
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .map_err(|_| format!("无法识别快捷键「{combo}」"))?;
+    // A bare letter or digit would be taken from every other app while typing.
+    if shortcut.mods.is_empty() && types_on_its_own(&shortcut.key) {
+        return Err(format!("快捷键「{combo}」需要至少一个修饰键（⌘ ⌥ ⌃ ⇧），否则会影响日常打字"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: settings::Settings) -> Result<(), String> {
+    settings.proxy.validate()?;
+    let combos = [&settings.hotkeys.shot, &settings.hotkeys.ocr, &settings.hotkeys.translate];
+    for combo in combos.iter().filter(|c| !c.trim().is_empty()) {
+        validate_hotkey(combo)?;
+    }
+    clog!(
+        "save settings: hotkeys {:?}, proxy {}, translator {}",
+        settings.hotkeys,
+        serde_json::to_string(&settings.proxy).unwrap_or_default(),
+        settings.translator.name()
+    );
+    let (a, b, c) = (combos[0].trim(), combos[1].trim(), combos[2].trim());
+    let duplicated = (!a.is_empty() && (a == b || a == c)) || (!b.is_empty() && b == c);
+    if duplicated {
+        return Err("三个功能不能使用相同的快捷键".to_string());
+    }
+    settings::save_to_disk(&app, &settings)?;
+    *lock(&state.settings) = settings;
+    // A bad binding must not survive on disk only to fail silently next launch.
+    if let Err(e) = overlay::register_hotkeys(&app) {
+        clog!("settings saved, but hotkeys were not applied: {e}");
+        return Err(e);
+    }
+    clog!("settings saved and applied");
+    if let Err(e) = tray::refresh(&app) {
+        clog!("{e}");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pick_save_dir(app: AppHandle, current: Option<String>) -> Option<String> {
+    let mut builder = app.dialog().file();
+    if let Some(dir) = current.filter(|d| !d.trim().is_empty()) {
+        builder = builder.set_directory(dir);
+    }
+    builder
+        .blocking_pick_folder()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+// ------------------------------------------------------------------------ misc
+
+/// Hand the next result to the result window. Push-based (`show-result` event)
+/// and pull-based (this command on mount) so a cold window never misses one.
+#[tauri::command]
+pub fn take_result(app: AppHandle) -> Option<Value> {
+    lock(&app.state::<AppState>().pending_result).take()
+}
+
+#[tauri::command]
+pub fn open_settings_window(app: AppHandle) {
+    overlay::show_settings(&app);
+}
+
+#[tauri::command]
+pub fn screen_capture_allowed() -> bool {
+    capture::screen_capture_allowed()
+}
+
+#[tauri::command]
+pub fn open_screen_settings() {
+    overlay::open_screen_settings();
+}
+
+#[tauri::command]
+pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn copy_text(app: AppHandle, text: String) -> Result<(), String> {
+    app.clipboard().write_text(&text).map_err(|e| format!("写入剪贴板失败：{e}"))
+}
+
+#[tauri::command]
+pub fn start_capture(app: AppHandle, mode: String) {
+    let mode = match mode.as_str() {
+        "ocr" => Mode::Ocr,
+        "translate" => Mode::Translate,
+        _ => Mode::Shot,
+    };
+    overlay::start(&app, mode);
+}
+
+/// Frontend errors land in the same log file as backend ones.
+#[tauri::command]
+pub fn log_message(message: String) {
+    clog!("[ui] {message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_hotkey;
+
+    #[test]
+    fn hotkeys_recorded_by_the_settings_page_are_accepted() {
+        // The formats the recorder produces, with every modifier and none of
+        // the ones that would break typing.
+        for combo in ["Alt+KeyA", "Alt+Shift+KeyA", "Ctrl+Cmd+KeyK", "Shift+Cmd+Digit1", "Cmd+Space", "F1", "F12", "Ctrl+F5"] {
+            assert!(validate_hotkey(combo).is_ok(), "{combo}");
+        }
+    }
+
+    #[test]
+    fn hotkeys_that_swallow_typing_are_refused() {
+        for combo in ["KeyA", "a", "Digit1", "1", "Space", "Comma"] {
+            let err = validate_hotkey(combo).unwrap_err();
+            assert!(err.contains("修饰键"), "{combo} → {err}");
+        }
+        assert!(validate_hotkey("nonsense").unwrap_err().contains("无法识别"));
+    }
+}
