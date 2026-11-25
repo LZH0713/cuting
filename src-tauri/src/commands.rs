@@ -7,7 +7,7 @@
 use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 
@@ -24,11 +24,66 @@ use crate::tray;
 use crate::util::lock;
 use crate::AppState;
 
-/// The frozen desktop, plus the selection in pixels.
-fn selected_frame(app: &AppHandle, rect: &Rect) -> Result<(Frame, IRect), String> {
-    let frame = overlay::session_frame(app).ok_or("截图会话已结束，请重新截图")?;
-    let px = frame.to_pixels(rect).ok_or("选区太小，请重新框选")?;
-    Ok((frame, px))
+/// The frame to crop from, plus the selection in its pixels.
+///
+/// A selection inside one display crops from that display's native frame
+/// (full Retina resolution); one spanning displays crops from the composited
+/// desktop. Also returns the display the drag started on (for window
+/// placement) and its rect.
+fn selected_frame(
+    app: &AppHandle,
+    label: &str,
+    rect: &Rect,
+) -> Result<(u32, Frame, IRect, Rect), String> {
+    let monitor_id = overlay::monitor_id_from_label(label).ok_or("不是截图覆盖层窗口")?;
+    let display = overlay::frame(app, monitor_id).ok_or("截图会话已结束，请重新截图")?;
+    let global = overlay::desktop_rect(app, label, rect).ok_or("截图会话已结束，请重新截图")?;
+    let desktop = overlay::desktop_frame(app).ok_or("截图会话已结束，请重新截图")?;
+    let screen = display.monitor.rect;
+    if display.monitor.rect.contains_rect(&global) {
+        let px = display.to_pixels(rect).ok_or("选区太小，请重新框选")?;
+        Ok((monitor_id, display, px, screen))
+    } else {
+        let screen = desktop.monitor.rect;
+        let px = desktop.to_pixels(&global).ok_or("选区太小，请重新框选")?;
+        Ok((monitor_id, desktop, px, screen))
+    }
+}
+
+/// Relay a page's selection rectangle (desktop coordinates) to every overlay,
+/// so each draws only the part that falls on its own display.
+#[tauri::command]
+pub fn broadcast_selection(app: AppHandle, rect: Option<Rect>, active: String) {
+    overlay::broadcast_selection(&app, rect, &active);
+}
+
+/// The beginning of a drag: announce it (this clears the box on other screens).
+#[tauri::command]
+pub fn selection_start(app: AppHandle, label: String, x: f64, y: f64) {
+    overlay::broadcast_selection(&app, None, &label);
+    let _ = (app, x, y);
+}
+
+/// The drag moved: convert to desktop coordinates and broadcast.
+#[tauri::command]
+pub fn selection_move(app: AppHandle, label: String, x: f64, y: f64) {
+    if let Some(monitor_id) = overlay::monitor_id_from_label(&label) {
+        if let Some(origin) = overlay::frame(&app, monitor_id).map(|f| f.monitor.rect) {
+            let rect = Rect::new(origin.x + x, origin.y + y, 0.0, 0.0);
+            overlay::broadcast_selection(&app, Some(rect), &label);
+        }
+    }
+}
+
+/// The drag ended: broadcast the final rectangle.
+#[tauri::command]
+pub fn selection_end(app: AppHandle, label: String, x: f64, y: f64) {
+    if let Some(monitor_id) = overlay::monitor_id_from_label(&label) {
+        if let Some(origin) = overlay::frame(&app, monitor_id).map(|f| f.monitor.rect) {
+            let rect = Rect::new(origin.x + x, origin.y + y, 0.0, 0.0);
+            overlay::broadcast_selection(&app, Some(rect), &label);
+        }
+    }
 }
 
 // ------------------------------------------------------------------- overlay
@@ -36,8 +91,8 @@ fn selected_frame(app: &AppHandle, rect: &Rect) -> Result<(Frame, IRect), String
 /// State for an overlay page. Pulled on mount because a `capture-start` event
 /// sent before the page finished loading would be lost.
 #[tauri::command]
-pub fn overlay_start_payload(app: AppHandle) -> Option<overlay::StartPayload> {
-    overlay::start_payload(&app)
+pub fn overlay_start_payload(window: WebviewWindow, app: AppHandle) -> Option<overlay::StartPayload> {
+    overlay::monitor_id_from_label(window.label()).and_then(|id| overlay::start_payload(&app, id))
 }
 
 /// Which overlay phase the page is in; the native magnifier only follows the
@@ -57,9 +112,9 @@ pub fn cancel_capture(app: AppHandle, reason: Option<String>) {
 }
 
 #[tauri::command]
-pub fn copy_region(app: AppHandle, rect: Rect) -> Result<Value, String> {
+pub fn copy_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<Value, String> {
     clog!("copy {rect:?}");
-    let (frame, px) = selected_frame(&app, &rect)?;
+    let (_, frame, px, _) = selected_frame(&app, window.label(), &rect)?;
     let image = frame.crop_image(&px).ok_or("裁剪截图失败")?;
     let scale = frame.scale();
     // Clipboard first: if it fails the overlay stays up and the user can retry.
@@ -72,9 +127,9 @@ pub fn copy_region(app: AppHandle, rect: Rect) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn save_region(app: AppHandle, rect: Rect) -> Result<Value, String> {
+pub async fn save_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<Value, String> {
     clog!("save {rect:?}");
-    let (frame, px) = selected_frame(&app, &rect)?;
+    let (_, frame, px, _) = selected_frame(&app, window.label(), &rect)?;
     let (width, height, scale) = (px.w as u32, px.h as u32, frame.scale());
     let rgba = frame.crop_rgba(&px);
     let png = tauri::async_runtime::spawn_blocking(move || capture::encode_png(&rgba, width, height, scale))
@@ -117,18 +172,19 @@ pub async fn save_region(app: AppHandle, rect: Rect) -> Result<Value, String> {
 /// whether the result window also offers a translation right away.
 #[tauri::command]
 pub async fn ocr_region(
+    window: WebviewWindow,
     app: AppHandle,
     state: State<'_, AppState>,
     rect: Rect,
     action: String,
 ) -> Result<Value, String> {
-    let (frame, px) = selected_frame(&app, &rect)?;
+    clog!("ocr_region invoked from {}", window.label());
+    let (monitor_id, frame, px, screen_rect) = selected_frame(&app, window.label(), &rect)?;
     let session_id = overlay::session_id(&app).ok_or("截图会话已结束，请重新截图")?;
-    let image = frame.crop_image(&px).ok_or("裁剪截图失败")?;
-    let screen_rect = frame.monitor.rect;
     let langs = lock(&state.settings).ocr_languages.clone();
     let mode = if action == "translate" { "translate" } else { "ocr" };
     clog!("ocr region {rect:?} (action {action}, session {session_id})");
+    let image = frame.crop_image(&px).ok_or("裁剪截图失败")?;
 
     // The overlay stays up (with the busy spinner) until recognition succeeds;
     // on failure the user can press Esc or redraw the selection.
@@ -178,7 +234,7 @@ pub async fn ocr_region(
         return Ok(json!({ "ok": false, "cancelled": true }));
     }
     overlay::end_session(&app);
-    overlay::show_result(&app, payload, Some((screen_rect, rect)));
+    overlay::show_result(&app, payload, Some((monitor_id, screen_rect)));
     Ok(json!({ "ok": true }))
 }
 

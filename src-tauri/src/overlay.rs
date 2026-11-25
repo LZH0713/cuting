@@ -1,17 +1,14 @@
-//! The selection overlay: capture flow, window lifecycle, and the AppKit glue
-//! that Tauri's window API doesn't expose.
+//! The full-screen selection overlay: capture flow, window lifecycle, and the
+//! AppKit glue that Tauri's window API doesn't expose.
 //!
 //! Latency notes, since this is the hot path:
-//! - One overlay window is created at startup and kept hidden, so no WebView
-//!   is ever cold-started by a hotkey press.
-//! - The frozen desktop is a native `NSImageView` *behind* the transparent
+//! - Overlay windows are created once at startup and kept hidden, so no
+//!   WebView is ever cold-started by a hotkey press.
+//! - The frozen frame is a native `NSImageView` *behind* the transparent
 //!   webview. Pixels never cross IPC; the web layer only draws UI.
-//!
-//! The window spans the bounding box of every display, so a selection can
-//! cross from one screen to another (the macOS-native behaviour of
-//! ⌘⇧4). Regions that belong to no display are dark in the frozen image.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use objc2::rc::Retained;
@@ -40,7 +37,6 @@ use crate::AppState;
 
 pub const RESULT_LABEL: &str = "result";
 pub const SETTINGS_LABEL: &str = "settings";
-pub const OVERLAY_LABEL: &str = "overlay";
 const RESULT_SIZE: (f64, f64) = (600.0, 540.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -64,8 +60,10 @@ impl Mode {
 pub struct Session {
     pub id: u64,
     pub mode: Mode,
-    /// The whole desktop, frozen: every display composited into one frame.
-    pub frame: Frame,
+    /// One frozen frame per display, for that display's overlay and payload.
+    pub frames: Vec<Frame>,
+    /// Every display composited into one frame, for crops that span displays.
+    pub desktop: Frame,
     pub previous_app_pid: Option<i32>,
 }
 
@@ -75,9 +73,9 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    static FROZEN_VIEW: RefCell<Option<Retained<NSImageView>>> = RefCell::new(None);
-    static MAG_VIEW: RefCell<Option<Retained<NSImageView>>> = RefCell::new(None);
-    static MAG_LABEL: RefCell<Option<Retained<NSTextField>>> = RefCell::new(None);
+    static FROZEN_VIEWS: RefCell<HashMap<String, Retained<NSImageView>>> = RefCell::new(HashMap::new());
+    static MAG_VIEWS: RefCell<HashMap<String, Retained<NSImageView>>> = RefCell::new(HashMap::new());
+    static MAG_LABELS: RefCell<HashMap<String, Retained<NSTextField>>> = RefCell::new(HashMap::new());
     static EVENT_MONITOR: RefCell<Option<Retained<AnyObject>>> = RefCell::new(None);
 }
 
@@ -87,6 +85,14 @@ const MAG_CSS: f64 = 126.0;
 const MAG_LABEL_CSS: f64 = 17.0;
 /// Half of the patch side in physical pixels (side = 2 * MAG_HALF + 1).
 const MAG_HALF: i32 = 10;
+
+fn overlay_label(monitor_id: u32) -> String {
+    format!("overlay-{monitor_id}")
+}
+
+pub fn monitor_id_from_label(label: &str) -> Option<u32> {
+    label.strip_prefix("overlay-")?.parse().ok()
+}
 
 /// Run `f` on the main thread: right away if we're already there, otherwise on
 /// the next main-loop turn.
@@ -103,6 +109,13 @@ fn on_main(app: &AppHandle, f: impl FnOnce() + Send + 'static) {
 fn to_ns_rect(rect: &Rect) -> objc2_core_foundation::CGRect {
     let main = CGDisplayBounds(CGMainDisplayID());
     cg_rect(rect.x, main.origin.y + main.size.height - rect.bottom(), rect.w, rect.h)
+}
+
+/// Mouse position in global CoreGraphics coordinates.
+fn mouse_cg() -> (f64, f64) {
+    let p = NSEvent::mouseLocation();
+    let main = CGDisplayBounds(CGMainDisplayID());
+    (p.x, main.origin.y + main.size.height - p.y)
 }
 
 fn ns_window(window: &WebviewWindow) -> Option<Retained<NSWindow>> {
@@ -125,31 +138,37 @@ pub(crate) fn webview_ns_view(ns: &NSWindow) -> Option<Retained<NSView>> {
         .find(|view| view.class().name().to_string_lossy().contains("WebView"))
 }
 
-fn overlay_window(app: &AppHandle) -> Option<WebviewWindow> {
-    app.get_webview_window(OVERLAY_LABEL)
-}
-
-pub(crate) fn ns_window_of(app: &AppHandle) -> Option<Retained<NSWindow>> {
-    ns_window(&overlay_window(app)?)
+pub(crate) fn ns_window_of(app: &AppHandle, monitor_id: u32) -> Option<Retained<NSWindow>> {
+    ns_window(&app.get_webview_window(&overlay_label(monitor_id))?)
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartPayload {
     pub session_id: u64,
+    /// This overlay's window label; pages echo it when reporting selections.
+    pub label: String,
+    /// This display's global origin (CSS, y down from the main display's
+    /// top-left): display-local + origin = desktop coordinates.
+    pub x: f64,
+    pub y: f64,
+    pub monitor_id: u32,
     pub mode: Mode,
-    /// Physical pixels per CSS pixel (the highest display scale).
+    /// Physical pixels per CSS pixel.
     pub scale: f64,
-    /// Size of the whole desktop area in CSS pixels; selections clamp here.
     pub width: f64,
     pub height: f64,
-    /// Windows in z-order (front first), local to the desktop area.
+    /// Windows in z-order (front first), local to this monitor.
     pub windows: Vec<WinRect>,
 }
 
 fn payload_for(session_id: u64, mode: Mode, frame: &Frame) -> StartPayload {
     StartPayload {
         session_id,
+        label: overlay_label(frame.monitor.id),
+        x: frame.monitor.rect.x,
+        y: frame.monitor.rect.y,
+        monitor_id: frame.monitor.id,
         mode,
         scale: frame.scale(),
         width: frame.monitor.rect.w,
@@ -158,22 +177,47 @@ fn payload_for(session_id: u64, mode: Mode, frame: &Frame) -> StartPayload {
     }
 }
 
-/// What the overlay page needs. Offered on demand because an event fired
-/// before a freshly created page finished loading would be lost.
-pub fn start_payload(app: &AppHandle) -> Option<StartPayload> {
+/// What an overlay window needs to know. Offered on demand because an event
+/// fired before a freshly created page finished loading would be lost.
+pub fn start_payload(app: &AppHandle, monitor_id: u32) -> Option<StartPayload> {
     let state = app.state::<AppState>();
     let session = lock(&state.session);
     let session = session.as_ref()?;
-    Some(payload_for(session.id, session.mode, &session.frame))
+    let frame = session.frames.iter().find(|f| f.monitor.id == monitor_id)?;
+    Some(payload_for(session.id, session.mode, frame))
 }
 
 pub fn is_active(app: &AppHandle) -> bool {
     lock(&app.state::<AppState>().session).is_some()
 }
 
-/// A cheap clone of the frozen desktop frame.
-pub fn session_frame(app: &AppHandle) -> Option<Frame> {
-    lock(&app.state::<AppState>().session).as_ref().map(|s| s.frame.clone())
+/// A cheap clone of the frozen frame for `monitor_id` in the active session.
+pub fn frame(app: &AppHandle, monitor_id: u32) -> Option<Frame> {
+    lock(&app.state::<AppState>().session).as_ref()?.frames.iter().find(|f| f.monitor.id == monitor_id).cloned()
+}
+
+/// A cheap clone of the composited desktop (every display in one frame).
+pub fn desktop_frame(app: &AppHandle) -> Option<Frame> {
+    lock(&app.state::<AppState>().session).as_ref().map(|s| s.desktop.clone())
+}
+
+/// Convert a display-local selection into desktop coordinates, so crops can
+/// come from the composited desktop frame. Unclamped: a selection that
+/// extends onto another display keeps its off-window coordinates here.
+pub fn desktop_rect(app: &AppHandle, label: &str, local: &Rect) -> Option<Rect> {
+    let monitor_id = monitor_id_from_label(label)?;
+    let frame = frame(app, monitor_id)?;
+    Some(Rect::new(local.x + frame.monitor.rect.x, local.y + frame.monitor.rect.y, local.w, local.h))
+}
+
+/// Relay a page's selection rectangle to every overlay page.
+///
+/// `rect` is DESKTOP coordinates (page display-local + display origin); each
+/// page draws only the part that falls on its own display, which is what
+/// makes a selection work across screens. `rect = None` clears everywhere
+/// (a drag restarted on another screen).
+pub fn broadcast_selection(app: &AppHandle, rect: Option<Rect>, active: &str) {
+    let _ = app.emit("selection-update", serde_json::json!({ "rect": rect, "active": active }));
 }
 
 /// Id of the capture on screen. Work that finishes asynchronously compares
@@ -223,39 +267,52 @@ fn start_on_main(app: &AppHandle, mode: Mode) {
     });
 }
 
-fn finish_start(app: &AppHandle, mode: Mode, result: Result<Frame, String>, previous_app_pid: Option<i32>) {
+fn finish_start(app: &AppHandle, mode: Mode, result: Result<Vec<Frame>, String>, previous_app_pid: Option<i32>) {
     CAPTURING.store(false, Ordering::SeqCst);
     match result {
-        Ok(frame) => present(app, mode, frame, previous_app_pid),
+        Ok(frames) if !frames.is_empty() => present(app, mode, frames, previous_app_pid),
         Err(e) => {
             clog!("capture failed: {e}");
             activate_previous(previous_app_pid);
             alert(app, "截图失败", e);
         }
+        Ok(_) => clog!("capture returned no displays"),
     }
 }
 
-/// Store the frozen desktop and put the overlay on screen.
-pub(crate) fn present(app: &AppHandle, mode: Mode, frame: Frame, previous_app_pid: Option<i32>) {
-    present_inner(app, mode, frame, previous_app_pid, true)
+/// Store the frozen frames and put the overlays on screen.
+pub(crate) fn present(app: &AppHandle, mode: Mode, frames: Vec<Frame>, previous_app_pid: Option<i32>) {
+    present_inner(app, mode, frames, previous_app_pid, true)
 }
 
-fn present_inner(app: &AppHandle, mode: Mode, frame: Frame, previous_app_pid: Option<i32>, activate: bool) {
+fn present_inner(app: &AppHandle, mode: Mode, frames: Vec<Frame>, previous_app_pid: Option<i32>, activate: bool) {
     let session_id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
-    let window = ensure_overlay_window(app).and_then(|window| prepare_overlay(&window, &frame).map(|_| window));
-    let window = match window {
-        Ok(window) => window,
-        Err(e) => {
-            clog!("{e}");
-            // Nothing is on screen, so there must be no session either —
-            // otherwise the next hotkey press would just "cancel" an invisible one.
-            alert(app, "截图失败", "无法显示截图覆盖层，请查看日志后重试".to_string());
-            return;
+    let mut shown = 0usize;
+    for frame in &frames {
+        match ensure_overlay_window(app, frame.monitor.id) {
+            Ok(window) => {
+                if let Err(e) = prepare_overlay(&window, frame) {
+                    clog!("overlay for display {}: {e}", frame.monitor.id);
+                    continue;
+                }
+                let _ = window.emit("capture-start", payload_for(session_id, mode, frame));
+                shown += 1;
+            }
+            Err(e) => clog!("overlay for display {}: {e}", frame.monitor.id),
         }
+    }
+    if shown == 0 {
+        // Nothing is on screen, so there must be no session either —
+        // otherwise the next hotkey press would just "cancel" an invisible one.
+        alert(app, "截图失败", "无法显示截图覆盖层，请查看日志后重试".to_string());
+        return;
+    }
+    let Some(desktop) = capture::union_frame(&frames) else {
+        clog!("union frame failed; nothing to present");
+        return;
     };
-    let _ = window.emit("capture-start", payload_for(session_id, mode, &frame));
     let state = app.state::<AppState>();
-    *lock(&state.session) = Some(Session { id: session_id, mode, frame, previous_app_pid });
+    *lock(&state.session) = Some(Session { id: session_id, mode, frames, desktop, previous_app_pid });
     if activate {
         show_overlays(app);
     } else {
@@ -264,45 +321,71 @@ fn present_inner(app: &AppHandle, mode: Mode, frame: Frame, previous_app_pid: Op
     install_magnifier(app);
 }
 
-/// Bring the overlay on screen and make ourselves the active app so the
+/// Show the overlays without taking focus or keyboard input. Only the
+/// automated self test uses this, so a run never interrupts whatever the
+/// user is doing.
+fn show_without_activation(app: &AppHandle) {
+    let monitors: Vec<u32> = lock(&app.state::<AppState>().session)
+        .as_ref()
+        .map(|s| s.frames.iter().map(|f| f.monitor.id).collect())
+        .unwrap_or_default();
+    for id in monitors {
+        if let Some(window) = ns_window_of(app, id) {
+            window.orderFrontRegardless();
+        }
+    }
+}
+
+/// Bring the overlays on screen and make ourselves the active app so the
 /// overlay receives keyboard events (Esc, arrows, Enter).
 fn show_overlays(app: &AppHandle) {
     let Some(mtm) = MainThreadMarker::new() else { return };
+    let monitors: Vec<(u32, Rect)> = lock(&app.state::<AppState>().session)
+        .as_ref()
+        .map(|s| s.frames.iter().map(|f| (f.monitor.id, f.monitor.rect)).collect())
+        .unwrap_or_default();
+    if monitors.is_empty() {
+        return;
+    }
     let application = NSApplication::sharedApplication(mtm);
     // The deprecated call is still the one that reliably works from a
     // non-active accessory app; `activate` alone is sometimes ignored.
     #[allow(deprecated)]
     application.activateIgnoringOtherApps(true);
     application.activate();
-    if let Some(window) = ns_window_of(app) {
-        window.orderFrontRegardless();
+
+    let (mx, my) = mouse_cg();
+    let mut key = None;
+    for (id, rect) in &monitors {
+        if rect.contains(mx, my) {
+            key = Some(*id);
+        }
+        if let Some(window) = ns_window_of(app, *id) {
+            window.orderFrontRegardless();
+        }
+    }
+    // The display under the mouse gets keyboard focus; Esc anywhere cancels.
+    if let Some(window) = key.or_else(|| monitors.first().map(|m| m.0)).and_then(|id| ns_window_of(app, id)) {
         window.makeKeyWindow();
     }
 }
 
-/// Show the overlay without taking focus or keyboard input. Only the
-/// automated self test uses this, so a run never interrupts whatever the
-/// user is doing.
-fn show_without_activation(app: &AppHandle) {
-    if let Some(window) = ns_window_of(app) {
-        window.orderFrontRegardless();
-    }
-}
-
-/// Take the overlay off screen and release the frozen pixels and the
+/// Take every overlay off screen and release the frozen pixels and the
 /// magnifier's event monitor.
 fn hide_overlays(app: &AppHandle) {
-    if let Some(window) = overlay_window(app) {
-        let _ = window.emit("capture-end", ());
-        if let Some(ns) = ns_window(&window) {
-            ns.orderOut(None);
-        }
-        // The view itself stays for next time; only its image is dropped.
-        FROZEN_VIEW.with(|view| {
-            if let Some(view) = view.borrow().as_ref() {
-                view.setImage(None);
+    for (label, window) in app.webview_windows() {
+        if monitor_id_from_label(&label).is_some() {
+            let _ = window.emit("capture-end", ());
+            if let Some(ns) = ns_window(&window) {
+                ns.orderOut(None);
             }
-        });
+            // The view itself stays for next time; only its image is dropped.
+            FROZEN_VIEWS.with(|views| {
+                if let Some(view) = views.borrow().get(&label) {
+                    view.setImage(None);
+                }
+            });
+        }
     }
     remove_magnifier_mt(app);
 }
@@ -469,21 +552,24 @@ pub fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
 
 // ------------------------------------------------------------ overlay windows
 
-/// Create the hidden overlay window up front so the first hotkey press
-/// doesn't pay for a cold WebView.
+/// Create hidden overlay windows for the current displays so the first
+/// hotkey press doesn't pay for a cold WebView.
 pub fn prewarm(app: &AppHandle) {
-    if let Err(e) = ensure_overlay_window(app) {
-        clog!("{e}");
+    for monitor in capture::active_displays() {
+        if let Err(e) = ensure_overlay_window(app, monitor.id) {
+            clog!("{e}");
+        }
     }
 }
 
-/// Create the hidden overlay window, or return the existing one.
-fn ensure_overlay_window(app: &AppHandle) -> Result<WebviewWindow, String> {
-    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+/// Create the hidden overlay window for a display, or return the existing one.
+fn ensure_overlay_window(app: &AppHandle, monitor_id: u32) -> Result<WebviewWindow, String> {
+    let label = overlay_label(monitor_id);
+    if let Some(window) = app.get_webview_window(&label) {
         return Ok(window);
     }
-    clog!("creating overlay window");
-    let window = WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::App("index.html".into()))
+    clog!("creating overlay window {label}");
+    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
         .title("Cuting")
         .decorations(false)
         .transparent(true)
@@ -516,8 +602,7 @@ fn configure_overlay(ns: &NSWindow) {
     ns.setIgnoresMouseEvents(false);
 }
 
-/// Fit the window to the whole desktop and put the frozen frame behind the
-/// webview.
+/// Fit the window to its display and put the frozen frame behind the webview.
 fn prepare_overlay(window: &WebviewWindow, frame: &Frame) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("prepare_overlay must run on the main thread")?;
     let ns = ns_window(window).ok_or("覆盖层窗口尚未就绪")?;
@@ -525,20 +610,20 @@ fn prepare_overlay(window: &WebviewWindow, frame: &Frame) -> Result<(), String> 
     ns.setFrame_display(to_ns_rect(&frame.monitor.rect), false);
 
     let webview = webview_ns_view(&ns).ok_or("覆盖层的网页视图尚未就绪")?;
-    let view = frozen_view(mtm, &ns, &webview);
+    let view = frozen_view(mtm, &ns, &webview, window.label());
     let image = NSImage::initWithCGImage_size(
         NSImage::alloc(),
         &frame.cg_image(),
         CGSize::new(frame.monitor.rect.w, frame.monitor.rect.h),
     );
     view.setImage(Some(&image));
-    ensure_magnifier(mtm, &webview);
+    ensure_magnifier(mtm, &ns, &webview, window.label());
     Ok(())
 }
 
 /// The image view sitting between the window background and the webview.
-fn frozen_view(mtm: MainThreadMarker, ns: &NSWindow, webview: &NSView) -> Retained<NSImageView> {
-    if let Some(view) = FROZEN_VIEW.with(|view| view.borrow().clone()) {
+fn frozen_view(mtm: MainThreadMarker, ns: &NSWindow, webview: &NSView, key: &str) -> Retained<NSImageView> {
+    if let Some(view) = FROZEN_VIEWS.with(|views| views.borrow().get(key).cloned()) {
         return view;
     }
     // SAFETY: plain getter on the live webview owned by the window.
@@ -549,7 +634,7 @@ fn frozen_view(mtm: MainThreadMarker, ns: &NSWindow, webview: &NSView) -> Retain
     view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
     view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
     parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, Some(webview));
-    FROZEN_VIEW.with(|slot| *slot.borrow_mut() = Some(view.clone()));
+    FROZEN_VIEWS.with(|views| views.borrow_mut().insert(key.to_string(), view.clone()));
     view
 }
 
@@ -559,10 +644,12 @@ fn frozen_view(mtm: MainThreadMarker, ns: &NSWindow, webview: &NSView) -> Retain
 /// and its colour readout are drawn from the frozen pixels, with no IPC on
 /// pointer moves. It never sits under the cursor (it keeps an 18 px gap), so
 /// it never swallows clicks meant for the overlay.
-fn ensure_magnifier(mtm: MainThreadMarker, webview: &NSView) {
+fn ensure_magnifier(mtm: MainThreadMarker, ns: &NSWindow, webview: &NSView, key: &str) {
     // SAFETY: plain getter on the live webview owned by the window.
-    let parent = unsafe { webview.superview() }.expect("webview has a superview");
-    let view = match MAG_VIEW.with(|slot| slot.borrow().clone()) {
+    let parent = unsafe { webview.superview() }
+        .or_else(|| ns.contentView())
+        .expect("window has a content view");
+    let view = match MAG_VIEWS.with(|views| views.borrow().get(key).cloned()) {
         Some(view) => view,
         None => {
             let view = NSImageView::initWithFrame(NSImageView::alloc(mtm), cg_rect(0.0, 0.0, MAG_CSS, MAG_CSS));
@@ -571,11 +658,11 @@ fn ensure_magnifier(mtm: MainThreadMarker, webview: &NSView) {
             view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
             view.setHidden(true);
             parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Above, Some(webview));
-            MAG_VIEW.with(|slot| *slot.borrow_mut() = Some(view.clone()));
+            MAG_VIEWS.with(|views| views.borrow_mut().insert(key.to_string(), view.clone()));
             view
         }
     };
-    if MAG_LABEL.with(|slot| slot.borrow().is_none()) {
+    if MAG_LABELS.with(|labels| labels.borrow().get(key).is_none()) {
         let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
         label.setFrame(cg_rect(0.0, 0.0, MAG_CSS, MAG_LABEL_CSS));
         label.setAutoresizingMask(NSAutoresizingMaskOptions::empty());
@@ -586,9 +673,8 @@ fn ensure_magnifier(mtm: MainThreadMarker, webview: &NSView) {
         label.setAlignment(NSTextAlignment::Center);
         label.setHidden(true);
         parent.addSubview_positioned_relativeTo(&label, NSWindowOrderingMode::Above, Some(&view));
-        MAG_LABEL.with(|slot| *slot.borrow_mut() = Some(label));
+        MAG_LABELS.with(|labels| labels.borrow_mut().insert(key.to_string(), label));
     }
-    let _ = view;
 }
 
 /// The overlay page tells us which phase it is in; the magnifier only follows
@@ -601,13 +687,13 @@ pub fn set_magnifier_phase(app: &AppHandle, select: bool) {
 }
 
 fn hide_magnifiers() {
-    MAG_VIEW.with(|slot| {
-        if let Some(view) = slot.borrow().as_ref() {
+    MAG_VIEWS.with(|views| {
+        for view in views.borrow().values() {
             view.setHidden(true);
         }
     });
-    MAG_LABEL.with(|slot| {
-        if let Some(label) = slot.borrow().as_ref() {
+    MAG_LABELS.with(|labels| {
+        for label in labels.borrow().values() {
             label.setHidden(true);
         }
     });
@@ -643,24 +729,17 @@ fn remove_magnifier_mt(app: &AppHandle) {
         }
     });
     hide_magnifiers();
-    MAG_VIEW.with(|slot| {
-        if let Some(view) = slot.borrow().as_ref() {
+    MAG_VIEWS.with(|views| {
+        for view in views.borrow().values() {
             view.setImage(None);
         }
     });
     app.state::<AppState>().magnifier_on.store(false, Ordering::Relaxed);
 }
 
-/// The pointer position of `event` in global CoreGraphics coordinates.
-fn event_cg(event: &NSEvent) -> Option<(f64, f64)> {
-    let Some(mtm) = MainThreadMarker::new() else { return None };
-    let in_window = event.locationInWindow();
-    let on_screen = event.window(mtm)?.convertPointToScreen(in_window);
-    let main = CGDisplayBounds(CGMainDisplayID());
-    Some((on_screen.x, main.origin.y + main.size.height - on_screen.y))
-}
-
 struct Zoomed {
+    monitor_id: u32,
+    monitor_rect: Rect,
     /// Output pixels; a square of `side * side * 4` bytes.
     pixels: Vec<u8>,
     side: u32,
@@ -670,10 +749,8 @@ struct Zoomed {
 
 /// Read what the magnifier should show. Pure pixel work, kept separate from
 /// the AppKit updates so the session lock is not held across them.
-fn zoom_at_cursor(gx: f64, gy: f64, frame: &Frame) -> Option<Zoomed> {
-    if !frame.monitor.rect.contains(gx, gy) {
-        return None;
-    }
+fn zoom_at_cursor(gx: f64, gy: f64, session: &Session) -> Option<Zoomed> {
+    let frame = session.frames.iter().find(|f| f.monitor.rect.contains(gx, gy))?;
     let s = frame.scale();
     let (w, h) = (frame.width as i32, frame.height as i32);
     let clamp_px = |v: f64, max: i32| (v.round() as i32).clamp(0, max - 1);
@@ -691,10 +768,21 @@ fn zoom_at_cursor(gx: f64, gy: f64, frame: &Frame) -> Option<Zoomed> {
     let pixels = capture::render_magnifier(&frame.rgba, frame.width, cx, cy, half, side)?;
     let at = (py as usize * frame.width + px as usize) * 4;
     Some(Zoomed {
+        monitor_id: frame.monitor.id,
+        monitor_rect: frame.monitor.rect,
         pixels,
         side: side as u32,
         picked: [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]],
     })
+}
+
+/// The pointer position of `event` in global CoreGraphics coordinates.
+fn event_cg(event: &NSEvent) -> Option<(f64, f64)> {
+    let Some(mtm) = MainThreadMarker::new() else { return None };
+    let in_window = event.locationInWindow();
+    let on_screen = event.window(mtm)?.convertPointToScreen(in_window);
+    let main = CGDisplayBounds(CGMainDisplayID());
+    Some((on_screen.x, main.origin.y + main.size.height - on_screen.y))
 }
 
 fn magnifier_track(app: &AppHandle, event: &NSEvent) {
@@ -709,27 +797,34 @@ fn magnifier_track(app: &AppHandle, event: &NSEvent) {
     let state = app.state::<AppState>();
     let zoomed = {
         let session = lock(&state.session);
-        session.as_ref().and_then(|s| zoom_at_cursor(gx, gy, &s.frame))
+        session.as_ref().and_then(|s| zoom_at_cursor(gx, gy, s))
     };
     let Some(zoomed) = zoomed else {
         hide_magnifiers();
         return;
     };
-    let Some(view) = MAG_VIEW.with(|slot| slot.borrow().clone()) else { return };
-    let Some(label) = MAG_LABEL.with(|slot| slot.borrow().clone()) else { return };
+    let label_key = overlay_label(zoomed.monitor_id);
+    let view = MAG_VIEWS.with(|views| views.borrow().get(&label_key).cloned());
+    let label = MAG_LABELS.with(|labels| labels.borrow().get(&label_key).cloned());
+    let (Some(view), Some(label)) = (view, label) else { return };
+    MAG_VIEWS.with(|views| {
+        for (key, other) in views.borrow().iter() {
+            other.setHidden(key != &label_key);
+        }
+    });
+    MAG_LABELS.with(|labels| {
+        for (key, other) in labels.borrow().iter() {
+            other.setHidden(key != &label_key);
+        }
+    });
     let Some(image) = capture::rgba_to_image(&zoomed.pixels, zoomed.side, zoomed.side) else { return };
     let ns_image = NSImage::initWithCGImage_size(NSImage::alloc(), &image, CGSize::new(MAG_CSS, MAG_CSS));
     view.setImage(Some(&ns_image));
 
     // Place it clear of the cursor, flipping sides near the screen edges.
-    // Desktop-local CSS coordinates, y growing downwards.
-    let frame = {
-        let session = lock(&state.session);
-        session.as_ref().map(|s| s.frame.clone())
-    };
-    let Some(frame) = frame else { return };
-    let (w, h) = (frame.monitor.rect.w, frame.monitor.rect.h);
-    let (css_x, css_y) = (gx - frame.monitor.rect.x, gy - frame.monitor.rect.y);
+    // Monitor-local CSS coordinates, y growing downwards.
+    let (w, h) = (zoomed.monitor_rect.w, zoomed.monitor_rect.h);
+    let (css_x, css_y) = (gx - zoomed.monitor_rect.x, gy - zoomed.monitor_rect.y);
     let stack = MAG_CSS + MAG_LABEL_CSS;
     let mut left = css_x + 18.0;
     let mut top = css_y + 18.0;
@@ -773,22 +868,33 @@ fn ensure_result_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 }
 
 /// Place the result window just below the selection, above it when there is
-/// no room, always fully inside `screen` (the desktop area).
-fn result_frame(screen: &Rect, sel: &Rect) -> Rect {
+/// no room, always fully inside the monitor.
+fn result_frame(anchor: Option<(u32, Rect)>) -> Rect {
     let (w, h) = RESULT_SIZE;
-    let x = sel.x.clamp(screen.x + 8.0, (screen.right() - w - 8.0).max(screen.x + 8.0));
-    let y = if sel.bottom() + 8.0 + h <= screen.bottom() {
+    let monitors = capture::active_displays();
+    let Some((anchor_id, sel)) = anchor else {
+        return monitors
+            .first()
+            .map(|m| Rect::new(m.rect.center().0 - w / 2.0, m.rect.center().1 - h / 2.0, w, h))
+            .unwrap_or(Rect::new(100.0, 100.0, w, h));
+    };
+    let Some(monitor) = monitors.iter().find(|m| m.id == anchor_id).or_else(|| monitors.first()) else {
+        return Rect::new(sel.x, sel.y, w, h);
+    };
+    let r = monitor.rect;
+    let x = sel.x.clamp(r.x + 8.0, (r.right() - w - 8.0).max(r.x + 8.0));
+    let y = if sel.bottom() + 8.0 + h <= r.bottom() {
         sel.bottom() + 8.0
-    } else if sel.y - 8.0 - h >= screen.y {
+    } else if sel.y - 8.0 - h >= r.y {
         sel.y - 8.0 - h
     } else {
-        sel.y.clamp(screen.y + 8.0, (screen.bottom() - h - 8.0).max(screen.y + 8.0))
+        sel.y.clamp(r.y + 8.0, (r.bottom() - h - 8.0).max(r.y + 8.0))
     };
     Rect::new(x, y, w, h)
 }
 
-/// Show `payload` in the result window, near the selection.
-pub fn show_result(app: &AppHandle, payload: serde_json::Value, anchor: Option<(Rect, Rect)>) {
+/// Show `payload` in the result window, near `anchor` (monitor id + selection).
+pub fn show_result(app: &AppHandle, payload: serde_json::Value, anchor: Option<(u32, Rect)>) {
     *lock(&app.state::<AppState>().pending_result) = Some(payload);
     let handle = app.clone();
     on_main(app, move || {
@@ -799,15 +905,8 @@ pub fn show_result(app: &AppHandle, payload: serde_json::Value, anchor: Option<(
                 return;
             }
         };
-        let (screen, sel) = anchor.unwrap_or_else(|| {
-            let screen = lock(&handle.state::<AppState>().session)
-                .as_ref()
-                .map(|s| s.frame.monitor.rect)
-                .unwrap_or(Rect::new(0.0, 0.0, 800.0, 600.0));
-            (screen, Rect::new(screen.x + 40.0, screen.y + 40.0, 100.0, 100.0))
-        });
         if let Some(ns) = ns_window(&window) {
-            ns.setFrame_display(to_ns_rect(&result_frame(&screen, &sel)), false);
+            ns.setFrame_display(to_ns_rect(&result_frame(anchor)), false);
         }
         // The self test keeps it hidden: the page still loads and takes the
         // payload, and nothing pops up on the user's screen.
@@ -854,24 +953,24 @@ pub fn show_settings(app: &AppHandle) {
 
 // ------------------------------------------------------------ self-test hooks
 //
-// The automated self test (`selftest.rs`) drives the real overlay window
+// The automated self test (`selftest.rs`) drives the real overlay windows
 // without needing screen-recording permission or the user's attention.
 
-/// Put the frozen desktop on screen without taking focus from whatever the
-/// user is doing.
-pub(crate) fn present_for_test(app: &AppHandle, mode: Mode, frame: Frame) {
-    present_inner(app, mode, frame, None, false);
+/// Put `frames` on screen without taking focus from whatever the user is doing.
+pub(crate) fn present_for_test(app: &AppHandle, mode: Mode, frames: Vec<Frame>) {
+    present_inner(app, mode, frames, None, false);
 }
 
-/// What is actually on screen: window geometry, the view stack and how the
-/// webview and the frozen image are set up. This is what lets the self test
-/// check the things a user would see.
-pub(crate) fn overlay_report(app: &AppHandle) -> serde_json::Value {
+/// What is actually on screen for one overlay: window geometry, the view stack
+/// and how the webview and the frozen image are set up. This is what lets the
+/// self test check the things a user would see.
+pub(crate) fn overlay_report(app: &AppHandle, monitor_id: u32) -> serde_json::Value {
     use serde_json::json;
     let rect_json = |r: CGRect| json!({ "x": r.origin.x, "y": r.origin.y, "w": r.size.width, "h": r.size.height });
-    let Some(window) = ns_window_of(app) else {
+    let Some(window) = ns_window_of(app, monitor_id) else {
         return json!({ "error": "no overlay window" });
     };
+    let key = overlay_label(monitor_id);
     let subviews: Vec<serde_json::Value> = window
         .contentView()
         .map(|content| {
@@ -900,10 +999,11 @@ pub(crate) fn overlay_report(app: &AppHandle) -> serde_json::Value {
                             })
                             .unwrap_or(serde_json::Value::Null);
                     }
+                    // wry installs a WKWebView subclass (WryWebView).
                     if class.contains("WebView") {
-                        // wry installs a WKWebView subclass. KVC can raise an
-                        // Objective-C exception for unknown keys; catching it
-                        // keeps the process alive.
+                        // Private, but KVC finds the `_drawsBackground` getter.
+                        // KVC raises an Objective-C exception for unknown keys;
+                        // catching it keeps the process alive.
                         let draws_background = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
                             view.valueForKey(&NSString::from_str("drawsBackground"))
                                 .and_then(|value| value.downcast::<NSNumber>().ok())
@@ -917,31 +1017,39 @@ pub(crate) fn overlay_report(app: &AppHandle) -> serde_json::Value {
                 .collect()
         })
         .unwrap_or_default();
-    let magnifier = MAG_VIEW.with(|slot| {
-        slot.borrow().as_ref().map(|view| {
-            // SAFETY: plain getter on a view we own a reference to.
-            let attached = unsafe { view.superview() }.is_some();
-            json!({ "hidden": view.isHidden(), "attached": attached, "frame": rect_json(view.frame()) })
-        })
-    });
-    let magnifier_label = MAG_LABEL.with(|slot| {
-        slot.borrow().as_ref().map(|label| {
-            json!({
-                "hidden": label.isHidden(),
+    let magnifier = MAG_VIEWS.with(|views| {
+        views
+            .borrow()
+            .get(&key)
+            // `attached` matters: a view that was never added to the window is
+            // "not hidden" and still invisible.
+            .map(|view| {
                 // SAFETY: plain getter on a view we own a reference to.
-                "attached": unsafe { label.superview() }.is_some(),
-                "frame": rect_json(label.frame()),
-                "text": label.stringValue().to_string(),
+                let attached = unsafe { view.superview() }.is_some();
+                json!({ "hidden": view.isHidden(), "attached": attached, "frame": rect_json(view.frame()) })
             })
-        })
+    });
+    let magnifier_label = MAG_LABELS.with(|labels| {
+        labels
+            .borrow()
+            .get(&key)
+            .map(|label| {
+                json!({
+                    "hidden": label.isHidden(),
+                    // SAFETY: plain getter on a view we own a reference to.
+                    "attached": unsafe { label.superview() }.is_some(),
+                    "frame": rect_json(label.frame()),
+                    "text": label.stringValue().to_string(),
+                })
+            })
     });
     json!({
         "frame": rect_json(window.frame()),
         "visible": window.isVisible(),
         "key": window.isKeyWindow(),
+        "app_active": MainThreadMarker::new().is_some_and(|mtm| NSApplication::sharedApplication(mtm).isActive()),
         "opaque": window.isOpaque(),
         "background_alpha": window.backgroundColor().alphaComponent(),
-        "app_active": MainThreadMarker::new().is_some_and(|mtm| NSApplication::sharedApplication(mtm).isActive()),
         "subviews": subviews,
         "magnifier": magnifier,
         "magnifier_label": magnifier_label,
@@ -949,13 +1057,13 @@ pub(crate) fn overlay_report(app: &AppHandle) -> serde_json::Value {
 }
 
 /// Deliver a synthetic mouse event to the overlay, as if the pointer were at
-/// desktop-local CSS `(x, y)` (y down). `kind` is one of `move`, `down`,
+/// CSS `(x, y)` (monitor-local, y down). `kind` is one of `move`, `down`,
 /// `drag`, `up`.
-pub(crate) fn post_mouse(app: &AppHandle, kind: &str, x: f64, y: f64) -> Result<(), String> {
+pub(crate) fn post_mouse(app: &AppHandle, monitor_id: u32, kind: &str, x: f64, y: f64) -> Result<(), String> {
     let Some(mtm) = MainThreadMarker::new() else {
         return Err("post_mouse must run on the main thread".to_string());
     };
-    let window = ns_window_of(app).ok_or("no overlay window")?;
+    let window = ns_window_of(app, monitor_id).ok_or("no overlay window")?;
     let event_type = match kind {
         "move" => NSEventType::MouseMoved,
         "down" => NSEventType::LeftMouseDown,

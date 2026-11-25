@@ -20,6 +20,11 @@ export type Mode = 'shot' | 'ocr' | 'translate';
 /** Sent to the overlay when a capture starts. Geometry is desktop-local CSS. */
 export interface StartPayload {
   sessionId: number;
+  /** This overlay's window label, echoed in selection broadcasts. */
+  label: string;
+  /** This display's global origin (desktop CSS). */
+  x: number;
+  y: number;
   mode: Mode;
   /** Physical pixels per CSS pixel. */
   scale: number;
@@ -103,13 +108,13 @@ export interface Translation {
   elapsedMs: number;
 }
 
-export type WindowKind = { kind: 'overlay' } | { kind: 'result' } | { kind: 'settings' };
+export type WindowKind = { kind: 'overlay'; monitorId: number } | { kind: 'result' } | { kind: 'settings' };
 
-/** The window label decides what a page renders: `overlay`, `result` or `settings`. */
+/** The window label decides what a page renders: `overlay-<displayId>`, `result` or `settings`. */
 export function detectWindow(): WindowKind {
   const label = getCurrentWebviewWindow().label;
-  if (label === 'overlay') {
-    return { kind: 'overlay' };
+  if (label.startsWith('overlay-')) {
+    return { kind: 'overlay', monitorId: Number(label.slice('overlay-'.length)) };
   }
   return label === 'result' ? { kind: 'result' } : { kind: 'settings' };
 }

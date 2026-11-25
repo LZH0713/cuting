@@ -45,6 +45,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::overlay_start_payload,
             commands::set_overlay_phase,
+            commands::broadcast_selection,
+            commands::selection_start,
+            commands::selection_move,
+            commands::selection_end,
             commands::cancel_capture,
             commands::copy_region,
             commands::save_region,

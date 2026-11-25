@@ -87,7 +87,7 @@ function Icon({ name }: { name: 'copy' | 'save' | 'ocr' | 'translate' | 'redo' |
  * Selection geometry lives in refs and is painted straight to the DOM: it
  * changes on every pointer move, which is far too hot for React state.
  */
-export function Overlay() {
+export function Overlay({ monitorId }: { monitorId: number }) {
   const [payload, setPayload] = useState<StartPayload | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -271,6 +271,13 @@ export function Overlay() {
     dragRef.current = drag;
     setInteracting(true);
     e.currentTarget.setPointerCapture(e.pointerId);
+    // Other screens sync with this drag: cleared on a fresh drag, or told the
+    // current box while a handle/move drag resizes an existing selection.
+    if (drag.kind === 'new') {
+      void call('selection_start', { label: payloadRef.current?.label ?? '', x, y }).catch(() => {});
+    } else if (sel) {
+      void call('selection_move', { label: payloadRef.current?.label ?? '', x: sel.x, y: sel.y, w: sel.w, h: sel.h }).catch(() => {});
+    }
   };
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -310,6 +317,8 @@ export function Overlay() {
     dragRef.current = null;
     const { x, y } = localPoint(e);
     const sel = applyDrag(drag, x, y, p.width, p.height);
+    // Announce the final rectangle to other screens.
+    void call('selection_end', { label: p.label, x: sel.x, y: sel.y, w: sel.w, h: sel.h }).catch(() => {});
     if (!drag.moved && drag.kind === 'new') {
       // 单击：贴住窗口轮廓；没有窗口就清空
       const w = windowAt(x, y, p);
@@ -394,12 +403,37 @@ export function Overlay() {
     listen('capture-end', () => {
       if (!disposed) reset();
     }).then((un) => unlistens.push(un));
+    // Another display's page is dragging: draw this display's share of the box.
+    listen<{ rect: Rect | null; active: string }>('selection-update', (e) => {
+      if (disposed) return;
+      const mine = payloadRef.current;
+      if (!mine || e.payload.active === mine.label) return; // my own drag renders locally
+      const global = e.payload.rect;
+      if (!global) {
+        selRef.current = null;
+        paint(null);
+        return;
+      }
+      // Intersect the desktop rect with this display, then make it display-local.
+      const dx0 = Math.max(global.x, mine.x);
+      const dy0 = Math.max(global.y, mine.y);
+      const dx1 = Math.min(global.x + global.w, mine.x + mine.width);
+      const dy1 = Math.min(global.y + global.h, mine.y + mine.height);
+      if (dx1 <= dx0 || dy1 <= dy0) {
+        selRef.current = null;
+        paint(null);
+        return;
+      }
+      const local: Rect = { x: dx0 - mine.x, y: dy0 - mine.y, w: dx1 - dx0, h: dy1 - dy0 };
+      selRef.current = local;
+      paint(local);
+    }).then((un) => unlistens.push(un));
     return () => {
       disposed = true;
       unlistens.forEach((un) => un());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [monitorId]);
 
   return (
     <div

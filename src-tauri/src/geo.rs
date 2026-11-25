@@ -45,6 +45,11 @@ impl Rect {
         x >= self.x && y >= self.y && x < self.right() && y < self.bottom()
     }
 
+    /// Whether `other` fits entirely inside `self`.
+    pub fn contains_rect(&self, other: &Rect) -> bool {
+        other.x >= self.x && other.y >= self.y && other.right() <= self.right() && other.bottom() <= self.bottom()
+    }
+
     pub fn intersection(&self, other: &Rect) -> Option<Rect> {
         let x = self.x.max(other.x);
         let y = self.y.max(other.y);

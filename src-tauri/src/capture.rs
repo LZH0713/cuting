@@ -144,89 +144,6 @@ impl Frame {
     pub fn cg_image(&self) -> CFRetained<CGImage> {
         self.image.get()
     }
-
-    /// One frame covering the bounding box of every display, so a selection
-    /// can span displays (the macOS-native behaviour). Regions that belong to
-    /// no display — the gap between two screens — are filled dark. Frames are
-    /// resampled to the highest scale; single-scale setups pay nothing.
-    pub fn union_frame(frames: &[Frame]) -> Option<Frame> {
-        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        let mut max_scale = f64::MIN;
-        for frame in frames {
-            x0 = x0.min(frame.monitor.rect.x);
-            y0 = y0.min(frame.monitor.rect.y);
-            x1 = x1.max(frame.monitor.rect.right());
-            y1 = y1.max(frame.monitor.rect.bottom());
-            max_scale = max_scale.max(frame.scale());
-        }
-        if frames.is_empty() || !(x1 > x0 && y1 > y0) || max_scale <= 0.0 {
-            return None;
-        }
-        let union = Rect::new(x0, y0, x1 - x0, y1 - y0);
-        let width = (union.w * max_scale).round() as usize;
-        let height = (union.h * max_scale).round() as usize;
-        // Gaps between displays: a dark shade reads as "desktop behind the mask".
-        let mut rgba = vec![26u8; width * height * 4];
-        for chunk in rgba.chunks_exact_mut(4) {
-            chunk[3] = 255;
-        }
-        for frame in frames {
-            let factor = max_scale / frame.scale();
-            let (fw, fh) = (frame.width as usize, frame.height as usize);
-            let (w, h) = ((fw as f64 * factor).round() as usize, (fh as f64 * factor).round() as usize);
-            let ox = ((frame.monitor.rect.x - union.x) * max_scale).round() as usize;
-            let oy = ((frame.monitor.rect.y - union.y) * max_scale).round() as usize;
-            let put = |dst: &mut [u8], src: &[u8], x: usize, y: usize| {
-                if y >= height || x >= width {
-                    return;
-                }
-                let cols = w.min(width - x);
-                let rows = h.min(height - y);
-                for row in 0..rows {
-                    let dst_start = ((y + row) * width + x) * 4;
-                    let len = cols * 4;
-                    dst[dst_start..dst_start + len].copy_from_slice(&src[row * w * 4..row * w * 4 + len]);
-                }
-            };
-            if factor == 1.0 {
-                put(&mut rgba, &frame.rgba, ox, oy);
-            } else {
-                // Nearest-neighbour: it is the backdrop and the magnifier
-                // source, where a crisp pixel grid matters more than smoothing.
-                let mut scaled = vec![0u8; w * h * 4];
-                for y in 0..h {
-                    let sy = ((y as f64 / factor) as usize).min(fh - 1);
-                    for x in 0..w {
-                        let sx = ((x as f64 / factor) as usize).min(fw - 1);
-                        let src = (sy * fw + sx) * 4;
-                        let dst = (y * w + x) * 4;
-                        scaled[dst..dst + 4].copy_from_slice(&frame.rgba[src..src + 4]);
-                    }
-                }
-                put(&mut rgba, &scaled, ox, oy);
-            }
-        }
-        let windows: Vec<WinRect> = frames
-            .iter()
-            .flat_map(|f| f.windows.iter().map(|w| WinRect {
-                id: w.id,
-                layer: w.layer,
-                pid: w.pid,
-                rect: Rect::new(w.rect.x + f.monitor.rect.x - union.x, w.rect.y + f.monitor.rect.y - union.y, w.rect.w, w.rect.h),
-            }))
-            .collect();
-        let monitor = MonitorInfo {
-            id: 0,
-            rect: union,
-            scale: max_scale,
-            pixel_width: width as u32,
-            pixel_height: height as u32,
-            is_main: true,
-        };
-        let mut frame = Frame::from_rgba(monitor, width, height, rgba);
-        frame.windows = windows;
-        Some(frame)
-    }
 }
 
 pub fn screen_capture_allowed() -> bool {
@@ -462,10 +379,9 @@ fn image_to_rgba(image: &CGImage) -> Result<(usize, usize, Vec<u8>), String> {
     Ok((w, h, out))
 }
 
-/// Capture every given display and composite them into a single frame that
-/// covers the whole desktop, so selections can cross displays. Must run off
-/// the main thread: it blocks while ScreenCaptureKit calls back.
-pub fn capture_all(monitors: &[MonitorInfo], own_pid: i32) -> Result<Frame, String> {
+/// Capture every given display. Must run off the main thread: it blocks while
+/// ScreenCaptureKit calls back.
+pub fn capture_all(monitors: &[MonitorInfo], own_pid: i32) -> Result<Vec<Frame>, String> {
     let t0 = crate::util::now_ms();
     // Blocking-pool threads have no autorelease pool of their own; without one,
     // every autoreleased object ScreenCaptureKit hands us would leak until the
@@ -473,7 +389,7 @@ pub fn capture_all(monitors: &[MonitorInfo], own_pid: i32) -> Result<Frame, Stri
     objc2::rc::autoreleasepool(|_| capture_all_inner(monitors, own_pid, t0))
 }
 
-fn capture_all_inner(monitors: &[MonitorInfo], own_pid: i32, t0: u128) -> Result<Frame, String> {
+fn capture_all_inner(monitors: &[MonitorInfo], own_pid: i32, t0: u128) -> Result<Vec<Frame>, String> {
     let content = shareable_content()?;
     // SAFETY: plain getters on the content returned by ScreenCaptureKit.
     let displays = unsafe { content.displays() };
@@ -533,16 +449,8 @@ fn capture_all_inner(monitors: &[MonitorInfo], own_pid: i32, t0: u128) -> Result
             }
         })
         .collect();
-    let frame = Frame::union_frame(&frames).ok_or("没有可用的显示器画面")?;
-    clog!(
-        "captured {} display(s) → desktop {}x{} pt @{} px/pt in {} ms",
-        frames.len(),
-        frame.monitor.rect.w,
-        frame.monitor.rect.h,
-        frame.scale(),
-        crate::util::now_ms() - t0
-    );
-    Ok(frame)
+    clog!("captured {} display(s) in {} ms", frames.len(), crate::util::now_ms() - t0);
+    Ok(frames)
 }
 
 /// Encode RGBA8 pixels as PNG. `pixels_per_point` is written as the PNG pixel
@@ -674,6 +582,80 @@ pub fn render_magnifier(
         invert(x1, i);
     }
     Some(out)
+}
+
+/// One frame covering the bounding box of every display, so a selection can
+/// span displays (the macOS-native behaviour). Regions that belong to no
+/// display — the gap between two screens — are filled dark. Frames are
+/// resampled to the highest scale; single-scale setups pay nothing.
+pub fn union_frame(frames: &[Frame]) -> Option<Frame> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut max_scale = f64::MIN;
+    for frame in frames {
+        x0 = x0.min(frame.monitor.rect.x);
+        y0 = y0.min(frame.monitor.rect.y);
+        x1 = x1.max(frame.monitor.rect.right());
+        y1 = y1.max(frame.monitor.rect.bottom());
+        max_scale = max_scale.max(frame.scale());
+    }
+    if frames.is_empty() || !(x1 > x0 && y1 > y0) || max_scale <= 0.0 {
+        return None;
+    }
+    let union = Rect::new(x0, y0, x1 - x0, y1 - y0);
+    let width = (union.w * max_scale).round() as usize;
+    let height = (union.h * max_scale).round() as usize;
+    // Gaps between displays: a dark shade reads as "desktop behind the mask".
+    let mut rgba = vec![26u8; width * height * 4];
+    for chunk in rgba.chunks_exact_mut(4) {
+        chunk[3] = 255;
+    }
+    for frame in frames {
+        let factor = max_scale / frame.scale();
+        let (fw, fh) = (frame.width as usize, frame.height as usize);
+        let (w, h) = ((fw as f64 * factor).round() as usize, (fh as f64 * factor).round() as usize);
+        let ox = ((frame.monitor.rect.x - union.x) * max_scale).round() as usize;
+        let oy = ((frame.monitor.rect.y - union.y) * max_scale).round() as usize;
+        let rows = h.min(height.saturating_sub(oy));
+        let cols = w.min(width.saturating_sub(ox));
+        for row in 0..rows {
+            let dst_start = ((oy + row) * width + ox) * 4;
+            let len = cols * 4;
+            if factor == 1.0 {
+                let src_start = row * fw * 4;
+                rgba[dst_start..dst_start + len].copy_from_slice(&frame.rgba[src_start..src_start + len]);
+            } else {
+                // Nearest-neighbour resample row: crisp for the backdrop.
+                for (dx, slot) in rgba[dst_start..dst_start + len].chunks_exact_mut(4).enumerate() {
+                    let sx = ((dx as f64 / factor) as usize).min(fw - 1);
+                    let sy = ((row as f64 / factor) as usize).min(fh - 1);
+                    let src = (sy * fw + sx) * 4;
+                    slot.copy_from_slice(&frame.rgba[src..src + 4]);
+                }
+            }
+        }
+    }
+    let windows: Vec<WinRect> = frames
+        .iter()
+        .flat_map(|f| {
+            f.windows.iter().map(|w| WinRect {
+                id: w.id,
+                layer: w.layer,
+                pid: w.pid,
+                rect: Rect::new(w.rect.x + f.monitor.rect.x - union.x, w.rect.y + f.monitor.rect.y - union.y, w.rect.w, w.rect.h),
+            })
+        })
+        .collect();
+    let monitor = MonitorInfo {
+        id: 0,
+        rect: union,
+        scale: max_scale,
+        pixel_width: width as u32,
+        pixel_height: height as u32,
+        is_main: true,
+    };
+    let mut frame = Frame::from_rgba(monitor, width, height, rgba);
+    frame.windows = windows;
+    Some(frame)
 }
 
 #[cfg(test)]
