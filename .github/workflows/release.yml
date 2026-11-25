@@ -22,7 +22,7 @@ jobs:
     env:
       APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      CUTING_SIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,15 +42,10 @@ jobs:
 
       - name: Import the code signing certificate
         if: env.APPLE_CERTIFICATE_P12 != ''
-        run: |
-          P12=$(mktemp); KEYCHAIN=build.keychain
-          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$P12"
-          security create-keychain -p "" "$KEYCHAIN"
-          security unlock-keychain -p "" "$KEYCHAIN"
-          security import "$P12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
-          ID=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/App Development|Apple Development|Developer Application/{print $2; exit}')
-          echo "CUTING_SIGN_IDENTITY=$ID" >> "$GITHUB_ENV"
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
       - name: Build
         env:
@@ -60,14 +55,14 @@ jobs:
           BUNDLES="app"
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then BUNDLES="app updater"; fi
           CONFIG_ARGS=""
-          if [ -n "$CUTING_SIGN_IDENTITY" ]; then
-            CONFIG_ARGS=$(printf -- '--config {"bundle":{"macOS":{"signingIdentity":"%s"}}}' "$CUTING_SIGN_IDENTITY")
+          if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            CONFIG_ARGS=$(printf -- '--config {"bundle":{"macOS":{"signingIdentity":"%s"}}}' "$APPLE_SIGNING_IDENTITY")
           fi
           # shellcheck disable=SC2086
           npm run tauri build -- --bundles $BUNDLES $CONFIG_ARGS
 
       - name: Sign the bundle (keeps screen-recording permission across updates)
-        if: env.CUTING_SIGN_IDENTITY != ''
+        if: env.APPLE_SIGNING_IDENTITY != ''
         run: sh src-tauri/scripts/sign-app.sh src-tauri/target/release/bundle/macos/Cuting.app
 
       - name: Collect artifacts
