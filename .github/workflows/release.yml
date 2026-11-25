@@ -76,9 +76,10 @@ jobs:
           mkdir -p release
           cp -R src-tauri/target/release/bundle/macos/Cuting.app release/
           ditto -c -k --sequesterRsrc --keepParent release/Cuting.app release/Cuting-macOS-arm64.zip
-          if ls src-tauri/target/release/bundle/updater/*.app.tar.gz >/dev/null 2>&1; then
-            cp src-tauri/target/release/bundle/updater/Cuting.app.tar.gz release/
-            cp src-tauri/target/release/bundle/updater/Cuting.app.tar.gz.sig release/
+          # On macOS the updater artifacts land next to the .app bundle.
+          if ls src-tauri/target/release/bundle/macos/*.app.tar.gz >/dev/null 2>&1; then
+            cp src-tauri/target/release/bundle/macos/Cuting.app.tar.gz release/
+            cp src-tauri/target/release/bundle/macos/Cuting.app.tar.gz.sig release/
             URL="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/Cuting.app.tar.gz"
             jq -n --arg version "$VERSION" --arg url "$URL" --rawfile sig release/Cuting.app.tar.gz.sig --arg notes "$(git log -1 --pretty=%B | sed '/^\s*$/d' | head -n 5)" \
               '{version: $version, notes: $notes, pub_date: (now | todateiso8601), platforms: { "darwin-aarch64": { signature: $sig, url: $url } } }' > release/latest.json
