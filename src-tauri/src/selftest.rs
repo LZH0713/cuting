@@ -25,8 +25,9 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::capture::{self, Frame, IRect};
+use crate::capture::{self, Frame};
 use crate::clog;
+use crate::geo::Rect;
 use crate::geo::MonitorInfo;
 use crate::overlay::{self, Mode};
 use crate::util::lock;
@@ -149,30 +150,32 @@ const RESULT_PAGE_STATE: &str = r#"(() => {
   });
 })()"#;
 
-fn drag(app: &AppHandle, monitor: u32, from: (f64, f64), to: (f64, f64)) -> Result<(), String> {
+fn drag(app: &AppHandle, off: (f64, f64), from: (f64, f64), to: (f64, f64)) -> Result<(), String> {
+    // Coordinates here are main-display CSS; the offset maps them into the
+    // desktop-local space the single overlay window lives in.
     on_main(app, move |app| {
-        overlay::post_mouse(app, monitor, "move", from.0, from.1)?;
-        overlay::post_mouse(app, monitor, "down", from.0, from.1)?;
+        overlay::post_mouse(app, "move", from.0 + off.0, from.1 + off.1)?;
+        overlay::post_mouse(app, "down", from.0 + off.0, from.1 + off.1)?;
         for step in 1..=10u32 {
             let t = f64::from(step) / 10.0;
             overlay::post_mouse(
                 app,
-                monitor,
                 "drag",
-                from.0 + (to.0 - from.0) * t,
-                from.1 + (to.1 - from.1) * t,
+                from.0 + (to.0 - from.0) * t + off.0,
+                from.1 + (to.1 - from.1) * t + off.1,
             )?;
         }
-        overlay::post_mouse(app, monitor, "up", to.0, to.1)
+        overlay::post_mouse(app, "up", to.0 + off.0, to.1 + off.1)
     })?
 }
 
-fn click(app: &AppHandle, monitor: u32, at: (f64, f64)) -> Result<(), String> {
+fn click(app: &AppHandle, at: (f64, f64)) -> Result<(), String> {
+    // Button coordinates come from the page, which is already desktop-local.
     clog!("[selftest] click at ({}, {})", at.0, at.1);
     on_main(app, move |app| {
-        overlay::post_mouse(app, monitor, "move", at.0, at.1)?;
-        overlay::post_mouse(app, monitor, "down", at.0, at.1)?;
-        overlay::post_mouse(app, monitor, "up", at.0, at.1)
+        overlay::post_mouse(app, "move", at.0, at.1)?;
+        overlay::post_mouse(app, "down", at.0, at.1)?;
+        overlay::post_mouse(app, "up", at.0, at.1)
     })?
 }
 
@@ -191,12 +194,14 @@ fn png_bytes(image: &NSImage) -> Result<Vec<u8>, String> {
 
 /// Screenshot of the page's own drawing (selection, toolbar, …), returned as
 /// RGBA plus the composited preview over the frozen frame.
-fn page_snapshot(app: &AppHandle, monitor: u32) -> Result<Vec<u8>, String> {
+fn page_snapshot(app: &AppHandle) -> Result<Vec<u8>, String> {
     let (tx, rx) = mpsc::channel::<Result<usize, String>>();
     let request_tx = tx.clone();
+    let label = overlay::OVERLAY_LABEL.to_string();
     on_main(app, move |app| {
         let requested = (move || {
-            let ns = overlay::ns_window_of(app, monitor).ok_or("no NSWindow")?;
+            let _window = app.get_webview_window(&label).ok_or("no overlay window")?;
+            let ns = overlay::ns_window_of(app).ok_or("no NSWindow")?;
             let view = overlay::webview_ns_view(&ns).ok_or("no webview view")?;
             // The webview is a WKWebView (wry's subclass of it).
             let webview = Retained::as_ptr(&view).cast::<WKWebView>() as *mut WKWebView;
@@ -358,17 +363,17 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1.5
 }
 
-/// Is the overlay built the way a user needs it to be: full-display, clear
+/// Is the overlay built the way a user needs it to be: full-desktop, clear
 /// background, screenshot underneath, transparent page on top.
-fn check_structure(report: &Value, monitor: &MonitorInfo, main_height: f64) -> Result<Value, String> {
+fn check_structure(report: &Value, screen: &Rect, pixels: (u32, u32), height_css: f64) -> Result<Value, String> {
     if let Some(error) = report.get("error") {
         return Err(error.as_str().unwrap_or("no overlay window").to_string());
     }
     let (x, y, w, h) = rect(&report["frame"]).ok_or("window frame missing")?;
     // AppKit window frame: origin at the bottom-left of the main display, y up.
-    let expected_y = main_height - (monitor.rect.y + monitor.rect.h);
-    if !(close(x, monitor.rect.x) && close(y, expected_y) && close(w, monitor.rect.w) && close(h, monitor.rect.h)) {
-        return Err(format!("window is at {x},{y} sized {w}x{h}; display is {:?}", monitor.rect));
+    let expected_y = height_css - (screen.y + screen.h);
+    if !(close(x, screen.x) && close(y, expected_y) && close(w, screen.w) && close(h, screen.h)) {
+        return Err(format!("window is at {x},{y} sized {w}x{h}; the desktop is {screen:?}"));
     }
     // The content view's children, back to front: the frozen frame, the
     // webview, then the magnifier and its label.
@@ -397,9 +402,9 @@ fn check_structure(report: &Value, monitor: &MonitorInfo, main_height: f64) -> R
     }
     let frozen_ok = frozen.is_some_and(|v| {
         v["class"].as_str() == Some("NSImageView")
-            && v["image"]["pixels"][0].as_u64() == Some(u64::from(monitor.pixel_width))
-            && v["image"]["pixels"][1].as_u64() == Some(u64::from(monitor.pixel_height))
-            && v["image"]["size"][0].as_f64().is_some_and(|w| close(w, monitor.rect.w))
+            && v["image"]["pixels"][0].as_u64() == Some(u64::from(pixels.0))
+            && v["image"]["pixels"][1].as_u64() == Some(u64::from(pixels.1))
+            && v["image"]["size"][0].as_f64().is_some_and(|w| close(w, screen.w))
             && v["autoresizing"].as_u64() != Some(0)
     });
     if !frozen_ok {
@@ -452,53 +457,67 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
         rec.step("displays", Err("no displays".into()), Value::Null);
         return rec.finish(started);
     };
-    let main_height = main.rect.h;
     let fixture = std::env::var_os("CUTING_SELFTEST_FIXTURE").and_then(|p| std::fs::read(p).ok());
-    let make_frames = || -> Vec<Frame> { monitors.iter().map(|m| synthetic_frame(m, fixture.as_deref())).collect() };
-    let frame = make_frames().into_iter().find(|f| f.monitor.id == main.id).expect("frame of the main display");
-    let (main_id, height_css) = (main.id, main.rect.h);
+    let make_desktop = || -> Frame {
+        let frames: Vec<Frame> = monitors.iter().map(|m| synthetic_frame(m, fixture.as_deref())).collect();
+        Frame::union_frame(&frames).expect("union of the displays")
+    };
+    let desktop = make_desktop();
+    // Where the main display sits inside the desktop: all posted mouse
+    // coordinates are main-display CSS and need this shift. Page coordinates
+    // (and the expectations derived from them) are already desktop-local.
+    let off = (main.rect.x - desktop.monitor.rect.x, main.rect.y - desktop.monitor.rect.y);
+    let height_css = desktop.monitor.rect.h;
     rec.step(
         "displays",
-        Ok(json!({ "count": monitors.len(), "main": main_id, "scale": frame.scale(), "pixels": [frame.width, frame.height] })),
+        Ok(json!({
+            "count": monitors.len(),
+            "desktop": [desktop.monitor.rect.w, desktop.monitor.rect.h],
+            "scale": desktop.scale(),
+            "pixels": [desktop.width, desktop.height],
+            "mainOffset": [off.0, off.1],
+        })),
         Value::Null,
     );
 
-    let frames = make_frames();
+    let desktop = make_desktop();
+    let present_frame = desktop.clone();
     let shown = on_main(app, move |app| {
-        overlay::present_for_test(app, Mode::Shot, frames);
+        overlay::present_for_test(app, Mode::Shot, present_frame);
     });
     rec.step("present", shown.map(|_| json!(null)), Value::Null);
     pause(1800);
 
-    let report = on_main(app, move |app| overlay::overlay_report(app, main_id))
+    let report = on_main(app, move |app| overlay::overlay_report(app))
         .unwrap_or_else(|e| json!({ "error": e }));
-    rec.step("overlay structure", check_structure(&report, &main, main_height), report.clone());
+    rec.step("overlay structure", check_structure(&report, &desktop.monitor.rect, (desktop.width as u32, desktop.height as u32), height_css), report.clone());
 
     // Move onto the marker block: the magnifier must show up and read its colour.
-    let moved = on_main(app, move |app| overlay::post_mouse(app, main_id, "move", 400.0, 400.0));
+    let (mx, my) = (400.0 + off.0, 400.0 + off.1);
+    let moved = on_main(app, move |app| overlay::post_mouse(app, "move", mx, my));
     pause(300);
-    let report = on_main(app, move |app| overlay::overlay_report(app, main_id)).unwrap_or_else(|e| json!({ "error": e }));
+    let report = on_main(app, move |app| overlay::overlay_report(app)).unwrap_or_else(|e| json!({ "error": e }));
     let label = report["magnifier_label"].clone();
-    rec.step("magnifier follows the cursor", moved.and_then(|_| check_magnifier(&report, (400.0, 400.0), height_css)), label);
+    rec.step("magnifier follows the cursor", moved.and_then(|_| check_magnifier(&report, (mx, my), height_css)), label);
 
-    let overlay_label = format!("overlay-{main_id}");
-    let page = ask_page(app, &overlay_label, OVERLAY_PAGE_STATE);
+    let page = ask_page(app, overlay::OVERLAY_LABEL, OVERLAY_PAGE_STATE);
     rec.step("page loaded", page.clone().map(|p| p["viewport"].clone()), json!(null));
-    let snapshot = page_snapshot(app, main_id).and_then(|png| composite_preview(&frame, &png, out, "01-selecting.png"));
+    let snapshot = page_snapshot(app).and_then(|png| composite_preview(&desktop, &png, out, "01-selecting.png"));
     rec.step("preview 01-selecting.png", snapshot.map(|size| json!({ "size": size })), Value::Null);
 
     // Drag out a selection and expect the selection box and the toolbar.
-    let selected = drag(app, main_id, (400.0, 380.0), (1100.0, 700.0));
+    let selected = drag(app, off, (400.0, 380.0), (1100.0, 700.0));
     pause(500);
-    let page = ask_page(app, &overlay_label, OVERLAY_PAGE_STATE);
+    let page = ask_page(app, overlay::OVERLAY_LABEL, OVERLAY_PAGE_STATE);
     let selection = page.as_ref().ok().and_then(|p| rect(&p["selection"]));
-    let selection_ok = matches!(selection, Some((x, y, w, h)) if close(x, 400.0) && close(y, 380.0) && close(w, 700.0) && close(h, 320.0));
+    let (want_x, want_y) = (400.0 + off.0, 380.0 + off.1);
+    let selection_ok = matches!(selection, Some((x, y, w, h)) if close(x, want_x) && close(y, want_y) && close(w, 700.0) && close(h, 320.0));
     rec.step(
         "drag selects 700x320",
         selected
             .and_then(|_| page.clone())
             .and_then(|p| if selection_ok { Ok(p["selection"].clone()) } else { Err(format!("selection is {}", p["selection"])) }),
-        json!({ "expected": { "x": 400, "y": 380, "w": 700, "h": 320 } }),
+        json!({ "expected": { "x": want_x, "y": want_y, "w": 700, "h": 320 } }),
     );
     let buttons = page.as_ref().ok().and_then(|p| p["buttons"].as_array()).cloned().unwrap_or_default();
     let toolbar_ok = page.as_ref().is_ok_and(|p| p["toolbar"]["display"].as_str() == Some("flex")) && buttons.len() == 6;
@@ -508,15 +527,16 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
         page.clone().and_then(|p| if toolbar_ok { Ok(p["buttons"].clone()) } else { Err(format!("toolbar is {toolbar}")) }),
         toolbar,
     );
-    let report = on_main(app, move |app| overlay::overlay_report(app, main_id)).unwrap_or_else(|e| json!({ "error": e }));
+    let report = on_main(app, move |app| overlay::overlay_report(app)).unwrap_or_else(|e| json!({ "error": e }));
     let hidden = report["magnifier"]["hidden"].as_bool() == Some(true) && report["magnifier_label"]["hidden"].as_bool() == Some(true);
     rec.step("magnifier steps aside for the toolbar", if hidden { Ok(json!(null)) } else { Err("still visible".into()) }, report["magnifier"].clone());
-    let snapshot = page_snapshot(app, main_id).and_then(|png| composite_preview(&frame, &png, out, "02-selected.png"));
+    let snapshot = page_snapshot(app).and_then(|png| composite_preview(&desktop, &png, out, "02-selected.png"));
     rec.step("preview 02-selected.png", snapshot.map(|size| json!({ "size": size })), Value::Null);
 
     // Copy through the toolbar button and compare the clipboard with the crop.
-    let expected = IRect { x: 800, y: 760, w: 1400, h: 640 };
-    let expected_pixels = frame.crop_rgba(&expected);
+    let page_rect = Rect { x: 400.0 + off.0, y: 380.0 + off.1, w: 700.0, h: 320.0 };
+    let expected_px = desktop.to_pixels(&page_rect).expect("selection on the desktop");
+    let expected_pixels = desktop.crop_rgba(&expected_px);
     // 复制 is the last button on purpose: a drag ends at the bottom-right
     // corner, so the most used action sits under the released cursor.
     let copy_button = buttons
@@ -525,10 +545,10 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
         .and_then(|b| b["x"].as_f64().zip(b["y"].as_f64()));
     let copied = copy_button
         .ok_or_else(|| "no copy button on the toolbar".to_string())
-        .and_then(|at| click(app, main_id, at))
+        .and_then(|at| click(app, at))
         .and_then(|_| {
             pause(900);
-            let (active, visible) = on_main(app, move |app| (overlay::is_active(app), overlay::overlay_report(app, main_id)["visible"].as_bool()))?;
+            let (active, visible) = on_main(app, move |app| (overlay::is_active(app), overlay::overlay_report(app)["visible"].as_bool()))?;
             // Copy the pixels out on the main thread: the borrowed image can't leave it.
             let clip = on_main(app, move |app| {
                 let image = app.clipboard().read_image().map_err(|e| e.to_string())?;
@@ -566,16 +586,16 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
         return rec.finish(started);
     }
 
-    // OCR: select the fixture and press the third toolbar button.
-    let frames = make_frames();
+    // OCR: select the fixture and press the toolbar button.
+    let desktop = make_desktop();
     let shown = on_main(app, move |app| {
-        overlay::present_for_test(app, Mode::Shot, frames);
+        overlay::present_for_test(app, Mode::Shot, desktop);
     });
     pause(1600);
-    let selected = shown.and_then(|_| drag(app, main_id, (590.0, 790.0), (1060.0, 920.0)));
+    let selected = shown.and_then(|_| drag(app, off, (590.0, 790.0), (1060.0, 920.0)));
     pause(500);
     let focus = on_main(app, move |app| {
-        let report = overlay::overlay_report(app, main_id);
+        let report = overlay::overlay_report(app);
         json!({ "key": report["key"], "app_active": report["app_active"] })
     })
     .unwrap_or(Value::Null);
@@ -596,7 +616,7 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
     // A real mouse click during the run can clear the selection, leaving the
     // recorded button coordinates stale. Re-read the toolbar and try twice.
     let click_ocr_button = |app: &AppHandle| -> Result<Value, String> {
-        let page = ask_page(app, &overlay_label, OVERLAY_PAGE_STATE)?;
+        let page = ask_page(app, overlay::OVERLAY_LABEL, OVERLAY_PAGE_STATE)?;
         let button = page["buttons"]
             .as_array()
             .and_then(|b| {
@@ -605,7 +625,7 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
                     .and_then(|b| b["x"].as_f64().zip(b["y"].as_f64()))
             })
             .ok_or_else(|| "no 提取文字 button on the toolbar".to_string())?;
-        click(app, main_id, button)?;
+        click(app, button)?;
         // What ended up under the click, if the recognition never started: a
         // native view covering the page answers with no .title here.
         let probe = format!(
@@ -613,7 +633,7 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
             x = button.0,
             y = button.1
         );
-        let hit = ask_page(app, &overlay_label, &probe).unwrap_or(Value::Null);
+        let hit = ask_page(app, overlay::OVERLAY_LABEL, &probe).unwrap_or(Value::Null);
         clog!("[selftest] ocr click at ({}, {}): {hit}", button.0, button.1);
         Ok(page)
     };
@@ -638,7 +658,7 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
                     fallback = true;
                     let clicked = ask_page(
                         app,
-                        &overlay_label,
+                        overlay::OVERLAY_LABEL,
                         r#"(() => { const b = [...document.querySelectorAll('.tool')].find((b) => b.title.includes('提取文字')); if (b) b.click(); return JSON.stringify({ clicked: !!b }); })()"#,
                     );
                     clog!("[selftest] synthetic click did not start the recognition; direct page click: {clicked:?}");
@@ -662,7 +682,7 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
                 Ok(json!({ "text": text, "ms": crate::util::now_ms() - started }))
             } else {
                 // Say why: a recognition failure is shown on the overlay itself.
-                let overlay_error = ask_page(app, &overlay_label, OVERLAY_PAGE_STATE)
+                let overlay_error = ask_page(app, overlay::OVERLAY_LABEL, OVERLAY_PAGE_STATE)
                     .map(|page| page["error"].clone())
                     .unwrap_or(Value::Null);
                 Err(format!(

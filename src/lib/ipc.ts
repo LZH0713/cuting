@@ -17,10 +17,9 @@ export interface WinRect {
 
 export type Mode = 'shot' | 'ocr' | 'translate';
 
-/** Sent to each overlay when a capture starts. All geometry is in CSS pixels local to the monitor. */
+/** Sent to the overlay when a capture starts. Geometry is desktop-local CSS. */
 export interface StartPayload {
   sessionId: number;
-  monitorId: number;
   mode: Mode;
   /** Physical pixels per CSS pixel. */
   scale: number;
@@ -104,13 +103,13 @@ export interface Translation {
   elapsedMs: number;
 }
 
-export type WindowKind = { kind: 'overlay'; monitorId: number } | { kind: 'result' } | { kind: 'settings' };
+export type WindowKind = { kind: 'overlay' } | { kind: 'result' } | { kind: 'settings' };
 
-/** The window label decides what a page renders: `overlay-<displayId>`, `result` or `settings`. */
+/** The window label decides what a page renders: `overlay`, `result` or `settings`. */
 export function detectWindow(): WindowKind {
   const label = getCurrentWebviewWindow().label;
-  if (label.startsWith('overlay-')) {
-    return { kind: 'overlay', monitorId: Number(label.slice('overlay-'.length)) };
+  if (label === 'overlay') {
+    return { kind: 'overlay' };
   }
   return label === 'result' ? { kind: 'result' } : { kind: 'settings' };
 }

@@ -87,7 +87,7 @@ function Icon({ name }: { name: 'copy' | 'save' | 'ocr' | 'translate' | 'redo' |
  * Selection geometry lives in refs and is painted straight to the DOM: it
  * changes on every pointer move, which is far too hot for React state.
  */
-export function Overlay({ monitorId }: { monitorId: number }) {
+export function Overlay() {
   const [payload, setPayload] = useState<StartPayload | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -399,7 +399,7 @@ export function Overlay({ monitorId }: { monitorId: number }) {
       unlistens.forEach((un) => un());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [monitorId]);
+  }, []);
 
   return (
     <div
