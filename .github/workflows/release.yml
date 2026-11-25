@@ -64,7 +64,7 @@ jobs:
             CONFIG_ARGS=$(printf -- '--config {"bundle":{"macOS":{"signingIdentity":"%s"}}}' "$CUTING_SIGN_IDENTITY")
           fi
           # shellcheck disable=SC2086
-          npm run tauri build -- --bundle $BUNDLES $CONFIG_ARGS
+          npm run tauri build -- --bundles $BUNDLES $CONFIG_ARGS
 
       - name: Sign the bundle (keeps screen-recording permission across updates)
         if: env.CUTING_SIGN_IDENTITY != ''
