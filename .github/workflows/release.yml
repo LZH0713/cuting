@@ -56,7 +56,10 @@ jobs:
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then BUNDLES="app updater"; fi
           CONFIG_ARGS=""
           if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
-            CONFIG_ARGS=$(printf -- '--config {"bundle":{"macOS":{"signingIdentity":"%s"}}}' "$APPLE_SIGNING_IDENTITY")
+            # A file path (no spaces) avoids the word-splitting that broke the
+            # inline JSON: the identity name itself contains spaces.
+            printf '{"bundle":{"macOS":{"signingIdentity":"%s"}}}' "$APPLE_SIGNING_IDENTITY" > "$RUNNER_TEMP/ci-config.json"
+            CONFIG_ARGS="--config $RUNNER_TEMP/ci-config.json"
           fi
           # shellcheck disable=SC2086
           npm run tauri build -- --bundles $BUNDLES $CONFIG_ARGS
