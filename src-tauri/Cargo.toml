@@ -1,6 +1,6 @@
 [package]
 name = "cuting"
-version = "0.1.4"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
@@ -37,7 +37,6 @@ tauri-plugin-global-shortcut = "2.4.1"
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 objc2 = "0.6"
-image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.18"
 tauri-plugin-single-instance = "2.5.5"
 objc2-web-kit = "0.3.2"

@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use objc2::rc::Retained;
@@ -21,7 +22,10 @@ use objc2_app_kit::{
     NSWindowCollectionBehavior, NSWindowOrderingMode, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGDisplayBounds, CGMainDisplayID};
+use objc2_core_graphics::{
+    CGDisplayBounds, CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback, CGDirectDisplayID,
+    CGMainDisplayID,
+};
 use objc2_foundation::{NSObjectNSKeyValueCoding, NSProcessInfo, NSNumber, NSString};
 use block2::RcBlock;
 use serde::Serialize;
@@ -77,6 +81,7 @@ thread_local! {
     static MAG_VIEWS: RefCell<HashMap<String, Retained<NSImageView>>> = RefCell::new(HashMap::new());
     static MAG_LABELS: RefCell<HashMap<String, Retained<NSTextField>>> = RefCell::new(HashMap::new());
     static EVENT_MONITOR: RefCell<Option<Retained<AnyObject>>> = RefCell::new(None);
+    static ESC_MONITOR: RefCell<Option<Retained<AnyObject>>> = RefCell::new(None);
 }
 
 /// Native magnifier size in CSS pixels.
@@ -106,7 +111,7 @@ fn on_main(app: &AppHandle, f: impl FnOnce() + Send + 'static) {
 
 /// Flip a global CoreGraphics rect (y down, origin = main display top-left)
 /// into AppKit screen coordinates (y up, origin = main display bottom-left).
-fn to_ns_rect(rect: &Rect) -> objc2_core_foundation::CGRect {
+pub(crate) fn to_ns_rect(rect: &Rect) -> objc2_core_foundation::CGRect {
     let main = CGDisplayBounds(CGMainDisplayID());
     cg_rect(rect.x, main.origin.y + main.size.height - rect.bottom(), rect.w, rect.h)
 }
@@ -118,7 +123,7 @@ fn mouse_cg() -> (f64, f64) {
     (p.x, main.origin.y + main.size.height - p.y)
 }
 
-fn ns_window(window: &WebviewWindow) -> Option<Retained<NSWindow>> {
+pub(crate) fn ns_window(window: &WebviewWindow) -> Option<Retained<NSWindow>> {
     let ptr = window.ns_window().ok()? as *mut NSWindow;
     if ptr.is_null() {
         return None;
@@ -388,6 +393,7 @@ fn hide_overlays(app: &AppHandle) {
         }
     }
     remove_magnifier_mt(app);
+    remove_esc_monitor();
 }
 
 /// Close the overlay. Returns the app that was frontmost before the capture so
@@ -555,10 +561,42 @@ pub fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
 /// Create hidden overlay windows for the current displays so the first
 /// hotkey press doesn't pay for a cold WebView.
 pub fn prewarm(app: &AppHandle) {
-    for monitor in capture::active_displays() {
+    let monitors = capture::active_displays();
+    if monitors.is_empty() {
+        clog!("prewarm: no active displays right now");
+        return;
+    }
+    for monitor in monitors {
         if let Err(e) = ensure_overlay_window(app, monitor.id) {
             clog!("{e}");
         }
+    }
+}
+
+static RECONFIG_APP: OnceLock<AppHandle> = OnceLock::new();
+
+extern "C-unwind" fn display_reconfigured(
+    _display: CGDirectDisplayID,
+    flags: CGDisplayChangeSummaryFlags,
+    _user_info: *mut std::ffi::c_void,
+) {
+    let Some(app) = RECONFIG_APP.get() else { return };
+    let handle = app.clone();
+    let flags = flags.0;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let handle2 = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            clog!("display change (flags {flags:#x}): re-prewarming overlay windows");
+            prewarm(&handle2);
+        });
+    });
+}
+
+pub fn install_display_reconfiguration(app: &AppHandle) {
+    let _ = RECONFIG_APP.set(app.clone());
+    unsafe {
+        CGDisplayRegisterReconfigurationCallback(Some(display_reconfigured), std::ptr::null_mut());
     }
 }
 
@@ -718,6 +756,37 @@ fn install_magnifier(app: &AppHandle) {
     // it) and we remove the monitor before the handle is dropped.
     let token = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) };
     EVENT_MONITOR.with(|m| *m.borrow_mut() = token);
+    install_esc_monitor(app);
+}
+
+fn install_esc_monitor(app: &AppHandle) {
+    if ESC_MONITOR.with(|m| m.borrow().is_some()) {
+        return;
+    }
+    let handle = app.clone();
+    let state_handle = app.clone();
+    let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+        let event = unsafe { event.as_ref() };
+        if event.r#type() == NSEventType::KeyDown
+            && event.keyCode() == 53
+            && state_handle.state::<AppState>().magnifier_on.load(Ordering::Relaxed)
+        {
+            clog!("esc rescue: canceling a session from the native monitor");
+            cancel(&handle);
+            return std::ptr::null_mut();
+        }
+        event as *const NSEvent as *mut NSEvent
+    });
+    let token = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) };
+    ESC_MONITOR.with(|m| *m.borrow_mut() = token);
+}
+
+fn remove_esc_monitor() {
+    ESC_MONITOR.with(|m| {
+        if let Some(token) = m.borrow_mut().take() {
+            unsafe { NSEvent::removeMonitor(&token) };
+        }
+    });
 }
 
 /// Main-thread teardown of the magnifier: monitor off, views hidden, pixels dropped.

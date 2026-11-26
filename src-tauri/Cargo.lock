@@ -752,12 +752,11 @@ dependencies = [
 
 [[package]]
 name = "cuting"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "block2",
  "chrono",
- "image",
  "md-5",
  "objc2",
  "objc2-app-kit",

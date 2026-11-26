@@ -8,12 +8,14 @@ mod geo;
 mod ocr;
 mod overlay;
 mod proxy;
+mod scroll;
 mod selftest;
 mod settings;
 mod translate;
 mod tray;
 mod util;
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
@@ -23,6 +25,8 @@ pub struct AppState {
     pub settings: Mutex<settings::Settings>,
     /// The capture currently on screen, frozen pixels included.
     pub session: Mutex<Option<overlay::Session>>,
+    /// The running long-screenshot job, if any.
+    pub scroll: Mutex<Option<std::sync::Arc<scroll::Job>>>,
     /// Result waiting for the result window to pick it up.
     pub pending_result: Mutex<Option<serde_json::Value>>,
     /// The overlay page is in its select phase; the native magnifier follows
@@ -30,10 +34,22 @@ pub struct AppState {
     pub magnifier_on: AtomicBool,
     /// Running the automated self test: windows stay out of the user's way.
     pub selftest: bool,
+    /// Overlay labels -> last JS heartbeat (ms epoch). A session presented to
+    /// a page whose heartbeats don't resume is dead (its webview wedged at
+    /// startup) and gets recreated — a dead page used to strand a frozen
+    /// screenshot over the whole desktop.
+    pub page_heartbeats: Mutex<HashMap<String, u64>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // A panic ends the process (release sets panic=abort), and with no
+    // terminal attached its message would vanish. Route it into the log file
+    // — the one place "why did my app die" is answerable.
+    std::panic::set_hook(Box::new(|info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        clog!("PANIC: {info}\nbacktrace:\n{bt}");
+    }));
     let selftest = selftest::requested();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -52,7 +68,13 @@ pub fn run() {
             commands::cancel_capture,
             commands::copy_region,
             commands::save_region,
+            commands::region_pixels,
             commands::ocr_region,
+            commands::scroll_capture_start,
+            commands::scroll_state,
+            commands::scroll_capture_save,
+            commands::scroll_capture_copy,
+            commands::scroll_capture_cancel,
             commands::translate_text,
             commands::test_network,
             commands::detect_local_proxies,
@@ -69,6 +91,7 @@ pub fn run() {
             commands::copy_text,
             commands::start_capture,
             commands::log_message,
+            commands::page_heartbeat,
             selftest::selftest_report,
         ]);
     // The single-instance lock is keyed by the app identifier. The self test
@@ -92,12 +115,19 @@ pub fn run() {
                 settings.hotkeys.ocr,
                 settings.hotkeys.translate
             );
+            // The first accurate request per process pays a model load that can
+            // stall for tens of seconds on a machine with a wedged ANE pipeline;
+            // pay it invisibly here instead of on the user's first screenshot.
+            // (The self test skips it on purpose: it exercises the degraded path.)
+            let ocr_langs = settings.ocr_languages.clone();
             app.manage(AppState {
                 settings: Mutex::new(settings),
                 session: Mutex::new(None),
+                scroll: Mutex::new(None),
                 pending_result: Mutex::new(None),
                 magnifier_on: AtomicBool::new(false),
                 selftest,
+                page_heartbeats: Mutex::new(HashMap::new()),
             });
             // Menu bar app (LSUIElement already keeps it out of the Dock): the
             // tray is the entry point.
@@ -118,6 +148,7 @@ pub fn run() {
                 }
                 tray::create(app)?;
                 overlay::prewarm(app.handle());
+                ocr::prewarm(ocr_langs);
                 // Quiet update check a few seconds in, so a slow network never
                 // delays startup. The result surfaces in the settings window.
                 let check_handle = app.handle().clone();

@@ -5,9 +5,11 @@
 //! lives in an `async` command or is moved to a blocking thread.
 
 use base64::Engine as _;
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGImage;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 
@@ -18,6 +20,7 @@ use crate::geo::Rect;
 use crate::ocr;
 use crate::overlay::{self, Mode};
 use crate::proxy;
+use crate::scroll;
 use crate::settings;
 use crate::translate;
 use crate::tray;
@@ -112,11 +115,14 @@ pub fn cancel_capture(app: AppHandle, reason: Option<String>) {
 }
 
 #[tauri::command]
-pub fn copy_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<Value, String> {
-    clog!("copy {rect:?}");
+pub fn copy_region(window: WebviewWindow, app: AppHandle, rect: Rect, annotation: Option<String>) -> Result<Value, String> {
+    clog!("copy {rect:?}{}", if annotation.is_some() { " (annotated)" } else { "" });
     let (_, frame, px, _) = selected_frame(&app, window.label(), &rect)?;
-    let image = frame.crop_image(&px).ok_or("裁剪截图失败")?;
     let scale = frame.scale();
+    let image = match annotated_crop(&frame, &px, annotation.as_deref())? {
+        Some(rgba) => capture::rgba_to_image(&rgba, px.w as u32, px.h as u32).ok_or("合成标注失败")?,
+        None => frame.crop_image(&px).ok_or("裁剪截图失败")?,
+    };
     // Clipboard first: if it fails the overlay stays up and the user can retry.
     // The image keeps its on-screen size, so a Retina shot doesn't paste huge.
     clipboard::write_image(&image, px.w as f64 / scale, px.h as f64 / scale)?;
@@ -126,19 +132,42 @@ pub fn copy_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<
     Ok(json!({ "ok": true, "width": px.w, "height": px.h }))
 }
 
+/// The selection's pixels with the web annotations composited in, or `None`
+/// when the selection is clean. The layer comes from the overlay page as a
+/// base64 PNG sized exactly like the crop; anything else is a bug to report.
+fn annotated_crop(frame: &Frame, px: &IRect, annotation: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    let Some(encoded) = annotation else { return Ok(None) };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("标注数据无法解码：{e}"))?;
+    let (w, h, layer) = capture::decode_png(&bytes)?;
+    if (w as i32, h as i32) != (px.w, px.h) {
+        return Err(format!("标注图层尺寸不匹配：{w}x{h}，应为 {}x{}", px.w, px.h));
+    }
+    Ok(Some(capture::composite_overlay(&frame.crop_rgba(px), &layer)?))
+}
+
 #[tauri::command]
-pub async fn save_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<Value, String> {
-    clog!("save {rect:?}");
+pub async fn save_region(window: WebviewWindow, app: AppHandle, rect: Rect, annotation: Option<String>) -> Result<Value, String> {
+    clog!("save {rect:?}{}", if annotation.is_some() { " (annotated)" } else { "" });
     let (_, frame, px, _) = selected_frame(&app, window.label(), &rect)?;
     let (width, height, scale) = (px.w as u32, px.h as u32, frame.scale());
-    let rgba = frame.crop_rgba(&px);
+    let rgba = match annotated_crop(&frame, &px, annotation.as_deref())? {
+        Some(annotated) => annotated,
+        None => frame.crop_rgba(&px),
+    };
     let png = tauri::async_runtime::spawn_blocking(move || capture::encode_png(&rgba, width, height, scale))
         .await
         .map_err(|e| e.to_string())??;
     let previous = overlay::end_session(&app);
+    spawn_save_dialog(&app, png, format!("截图 {}.png", crate::util::file_stamp()), previous);
+    Ok(json!({ "ok": true }))
+}
 
-    // The save panel belongs to us, so focus goes back to the previous app
-    // only after the panel closes.
+/// Show the save panel for an already-encoded PNG on the main thread, writing
+/// the file once the user picks a spot. `previous` is the app to hand focus
+/// back to after the panel closes.
+pub(crate) fn spawn_save_dialog(app: &AppHandle, png: Vec<u8>, default_name: String, previous: Option<i32>) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let dir = lock(&handle.state::<AppState>().settings)
@@ -152,7 +181,7 @@ pub async fn save_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> R
             .dialog()
             .file()
             .set_directory(dir)
-            .set_file_name(format!("截图 {}.png", crate::util::file_stamp()))
+            .set_file_name(default_name)
             .add_filter("PNG 图片", &["png"])
             .save_file(move |path| {
                 overlay::restore(&restore_handle, previous);
@@ -163,10 +192,56 @@ pub async fn save_region(window: WebviewWindow, app: AppHandle, rect: Rect) -> R
                 });
             });
     });
-    Ok(json!({ "ok": true }))
+}
+
+/// The selection's pixels as a PNG data URL, for the mosaic tool: it needs the
+/// real pixels under the selection to pixelate them.
+#[tauri::command]
+pub async fn region_pixels(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<String, String> {
+    let (_, frame, px, _) = selected_frame(&app, window.label(), &rect)?;
+    let scale = frame.scale();
+    // A full-res crop encode can reach tens of megabytes — keep it off the
+    // async workers.
+    let png = tauri::async_runtime::spawn_blocking(move || {
+        let rgba = frame.crop_rgba(&px);
+        capture::encode_png(&rgba, px.w as u32, px.h as u32, scale)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)))
 }
 
 // --------------------------------------------------------------- ocr / translate
+
+/// Everything the result payload needs except the recognition itself: the
+/// preview data URL and the crop's pixel size. Built once so the accurate
+/// pass and the fast fallback can share it.
+struct Prepared {
+    width: u32,
+    height: u32,
+    image_url: String,
+}
+
+/// One recognition attempt on the blocking pool, timed. The caller layers the
+/// staged timeouts and the fast fallback around this.
+async fn recognize_pass(
+    image: CFRetained<CGImage>,
+    langs: Vec<String>,
+    level: ocr::Level,
+) -> Result<(Vec<ocr::OcrLine>, u128), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = crate::util::now_ms();
+        let lines = match level {
+            ocr::Level::Accurate => ocr::recognize(&image, &langs)?,
+            ocr::Level::Fast => ocr::recognize_fast(&image, &langs)?,
+        };
+        let elapsed = crate::util::now_ms() - started;
+        clog!("ocr: {} line(s) in {elapsed} ms ({level:?})", lines.len());
+        Ok((lines, elapsed))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 /// Recognize the selection and show it in the result window. `action` decides
 /// whether the result window also offers a translation right away.
@@ -177,6 +252,7 @@ pub async fn ocr_region(
     state: State<'_, AppState>,
     rect: Rect,
     action: String,
+    annotation: Option<String>,
 ) -> Result<Value, String> {
     clog!("ocr_region invoked from {}", window.label());
     let (monitor_id, frame, px, screen_rect) = selected_frame(&app, window.label(), &rect)?;
@@ -189,44 +265,96 @@ pub async fn ocr_region(
     // The overlay stays up (with the busy spinner) until recognition succeeds;
     // on failure the user can press Esc or redraw the selection.
     //
-    // macOS 15's Vision service occasionally stops answering, leaving
-    // `performRequests` blocked forever (seen on this very machine). A timeout
-    // turns that into an error on the overlay instead of an endless spinner.
-    // The hung worker thread is abandoned; the process is long-lived, but one
-    // parked thread per total system failure is acceptable.
-    let work = tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
-        let started = crate::util::now_ms();
-        let lines = ocr::recognize(&image, &langs)?;
-        let text = ocr::lines_to_text(&lines);
+    // The system Vision pipeline can hang for tens of seconds — or forever:
+    // its accurate level waits on the ANE compiler service, which wedges after
+    // an OS update (seen on this very machine). `performRequests` cannot be
+    // cancelled, so a hung worker thread is abandoned, and `ocr::mark_hang`
+    // keeps later requests off that path. The wait is staged: at 20 s the user
+    // learns recognition is slow, at 40 s the accurate pass is declared hung
+    // and the fast level — which never touches the ANE — takes over.
+    let prep = tauri::async_runtime::spawn_blocking(move || -> Result<Prepared, String> {
+        // Recognition reads the clean pixels (annotations would confuse it),
+        // but the preview shows what the user drew. Both live here in the
+        // blocking pool: decoding and compositing a large layer means tens of
+        // megabytes of pixel work, too heavy for a tokio worker.
+        let annotated = annotated_crop(&frame, &px, annotation.as_deref())?;
         // Preview is capped at ~1200 px on its long side to keep the data URL small.
-        let (w, h) = (px.w as u32, px.h as u32);
-        let factor = (w.max(h) + 1199) / 1200;
-        let (pw, ph, preview) = capture::downscale_rgba(&frame.crop_rgba(&px), w, h, factor);
+        let pixels = annotated.unwrap_or_else(|| frame.crop_rgba(&px));
+        let factor = (px.w.max(px.h) as u32 + 1199) / 1200;
+        let (pw, ph, preview) = capture::downscale_rgba(&pixels, px.w as u32, px.h as u32, factor);
         let png = capture::encode_png(&preview, pw, ph, 1.0)?;
-        let image_url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png));
-        let elapsed = crate::util::now_ms() - started;
-        clog!("ocr: {} line(s) in {elapsed} ms", lines.len());
-        Ok(json!({
-            "mode": mode,
-            "image": image_url,
-            "text": text,
-            "lines": lines,
-            "elapsedMs": elapsed,
-            "width": w,
-            "height": h,
-        }))
-    });
-    let joined = match tokio::time::timeout(std::time::Duration::from_secs(20), work).await {
-        Ok(joined) => joined.map_err(|e| e.to_string())?,
-        Err(_) => {
-            clog!("ocr_region: recognition timed out; the system Vision service is not answering");
-            return Err(
-                "文字识别超时：系统的识别服务暂时没有响应（macOS 偶发问题）。请按 Esc 关闭后重试一次；反复出现时重启电脑可恢复。"
-                    .to_string(),
-            );
+        Ok(Prepared {
+            width: px.w as u32,
+            height: px.h as u32,
+            image_url: format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            ),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    const HUNG_MSG: &str = "文字识别超时：系统的识别服务暂时没有响应，快速识别也失败了（macOS 升级后的偶发问题）。请按 Esc 关闭后稍等一分钟再试；反复出现时重启电脑可恢复。";
+    const SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+    const HANG_AFTER: std::time::Duration = std::time::Duration::from_secs(40);
+    const FAST_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
+    // After a recent hang the accurate pass would just hang again; recognize
+    // at the fast level right away (slightly lower accuracy, instantly back).
+    let outcome: Result<(Vec<ocr::OcrLine>, u128, bool), String> = if ocr::cooling_down() {
+        clog!("ocr_region: system pipeline recently hung; recognizing at the fast level");
+        let pass = recognize_pass(image, langs, ocr::Level::Fast);
+        match tokio::time::timeout(FAST_AFTER, pass).await {
+            Ok(joined) => joined.map(|(lines, elapsed)| (lines, elapsed, true)),
+            Err(_) => {
+                ocr::mark_hang();
+                Err(HUNG_MSG.to_string())
+            }
+        }
+    } else {
+        // The accurate pass consumes these; the fallback needs its own copies
+        // (a `CFRetained` clone is just a retain, and the language list is tiny).
+        let mut pass = Box::pin(recognize_pass(image.clone(), langs.clone(), ocr::Level::Accurate));
+        match tokio::time::timeout(SLOW_AFTER, pass.as_mut()).await {
+            Ok(joined) => joined.map(|(lines, elapsed)| (lines, elapsed, false)),
+            Err(_) => {
+                clog!("ocr_region: accurate pass slower than 20 s; system pipeline degraded");
+                let _ = app.emit_to(window.label(), "ocr-slow", ());
+                match tokio::time::timeout(HANG_AFTER - SLOW_AFTER, pass.as_mut()).await {
+                    Ok(joined) => joined.map(|(lines, elapsed)| (lines, elapsed, false)),
+                    Err(_) => {
+                        ocr::mark_hang();
+                        clog!("ocr_region: accurate pass hung past 40 s; retrying at the fast level");
+                        let fast = recognize_pass(image, langs, ocr::Level::Fast);
+                        match tokio::time::timeout(FAST_AFTER, fast).await {
+                            Ok(joined) => joined.map(|(lines, elapsed)| (lines, elapsed, true)),
+                            Err(_) => {
+                                ocr::mark_hang();
+                                Err(HUNG_MSG.to_string())
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
-    let payload = joined?;
+
+    let (lines, elapsed, degraded) = outcome?;
+    let text = ocr::lines_to_text(&lines);
+    let mut payload = json!({
+        "mode": mode,
+        "image": prep.image_url,
+        "text": text,
+        "lines": lines,
+        "elapsedMs": elapsed,
+        "width": prep.width,
+        "height": prep.height,
+    });
+    if degraded {
+        payload["degraded"] = json!(true);
+        clog!("ocr_region: result served by the fast fallback");
+    }
     if overlay::session_id(&app) != Some(session_id) {
         // The user pressed Esc while recognition was running: don't pop a
         // result window on top of what they went back to.
@@ -463,10 +591,56 @@ pub fn start_capture(app: AppHandle, mode: String) {
     overlay::start(&app, mode);
 }
 
+// ---------------------------------------------------------------- long screenshot
+
+/// Enter scroll-capture mode from the overlay: the region becomes the first
+/// frame, the overlays come down, and the floating outline + control panel go up.
+#[tauri::command]
+pub fn scroll_capture_start(window: WebviewWindow, app: AppHandle, rect: Rect) -> Result<Value, String> {
+    scroll::start(&app, window.label(), &rect, None)?;
+    Ok(json!({ "ok": true }))
+}
+
+/// The panel's live state, for a page that loaded after the last event.
+#[tauri::command]
+pub fn scroll_state(app: AppHandle) -> Option<scroll::Progress> {
+    scroll::progress(&app)
+}
+
+/// Finish: encode the stitched image and show the save dialog.
+#[tauri::command]
+pub async fn scroll_capture_save(app: AppHandle) -> Result<Value, String> {
+    scroll::save(&app).await?;
+    Ok(json!({ "ok": true }))
+}
+
+/// Finish and copy the stitched image to the clipboard.
+#[tauri::command]
+pub fn scroll_capture_copy(app: AppHandle) -> Result<Value, String> {
+    let (width, height) = scroll::copy(&app)?;
+    Ok(json!({ "ok": true, "width": width, "height": height }))
+}
+
+/// Stop and discard.
+#[tauri::command]
+pub fn scroll_capture_cancel(app: AppHandle, reason: Option<String>) {
+    clog!("scroll capture cancel ({})", reason.as_deref().unwrap_or("unspecified"));
+    scroll::cancel(&app);
+}
+
 /// Frontend errors land in the same log file as backend ones.
 #[tauri::command]
 pub fn log_message(message: String) {
     clog!("[ui] {message}");
+}
+
+/// Overlay pages beat every ~1.5 s (in-memory, no IO). The overlay session
+/// watches for fresh beats after presenting; a page that never beats is dead
+/// (its webview wedged at startup) and gets recreated.
+#[tauri::command]
+pub fn page_heartbeat(app: AppHandle, label: String) {
+    let now = crate::util::now_ms() as u64;
+    lock(&app.state::<AppState>().page_heartbeats).insert(label, now);
 }
 
 #[cfg(test)]

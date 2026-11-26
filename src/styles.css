@@ -101,6 +101,27 @@ body {
   cursor: default;
 }
 
+/* The annotation palette stacks above the action row. */
+.toolbar.with-anno {
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+}
+
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.anno-palette {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
 .tool {
   width: 30px;
   height: 30px;
@@ -118,11 +139,100 @@ body {
   color: var(--accent);
 }
 
+.tool.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.tool:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 .tool-sep {
   width: 1px;
   height: 18px;
   margin: 0 3px;
   background: var(--border);
+}
+
+.swatch {
+  width: 18px;
+  height: 18px;
+  margin: 0 1px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.swatch.active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.width-dot {
+  width: 22px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.width-dot:hover {
+  background: #eef2ff;
+}
+
+.width-dot span {
+  display: block;
+  border-radius: 2px;
+  background: #374151;
+}
+
+.width-dot.active {
+  background: var(--accent);
+}
+
+.width-dot.active span {
+  background: #fff;
+}
+
+/* The annotation layer rides inside the selection box, above the frozen
+   pixels and below the resize handles. */
+.anno-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* 笔刷圈：手绘工具的笔画粗细指示（双环，任何底色都可见）。 */
+.brush-ring {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  outline: 1px solid rgba(0, 0, 0, 0.55);
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.anno-text-input {
+  position: absolute;
+  min-width: 60px;
+  min-height: 1.3em;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px dashed rgba(59, 130, 246, 0.9);
+  background: transparent;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  font-family: inherit;
+  font-weight: 600;
+  white-space: pre;
 }
 
 .notice,
@@ -492,4 +602,132 @@ body {
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+/* ------------------------------------------------------- scroll capture */
+
+/* A see-through frame around the region being captured; the window itself
+   ignores the mouse, so the page under it scrolls normally. */
+/* A see-through frame around the region being captured; the window itself
+   ignores the mouse, so the page under it scrolls normally. The window is
+   inflated 6 px beyond the region on every side (see scroll.rs), so this
+   border lives entirely outside the captured pixels. */
+.scroll-outline {
+  position: absolute;
+  inset: 0;
+  border: 3px solid var(--accent);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6) inset;
+  pointer-events: none;
+}
+
+.scroll-panel {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(17, 24, 39, 0.94);
+  color: #fff;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.scroll-panel .thumb {
+  width: 64px;
+  height: 84px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.scroll-panel .thumb img {
+  width: 100%;
+  object-fit: cover;
+  object-position: top;
+}
+
+.scroll-panel .info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.scroll-panel .title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.scroll-panel .status {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.75);
+  white-space: nowrap;
+}
+
+.scroll-panel .status b {
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+
+.scroll-panel .actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.scroll-panel button {
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 7px;
+  /* 不透明底：面板悬浮在任意内容上，透明按钮会看不清 */
+  background: #3a4254;
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.scroll-panel button:hover:not(:disabled) {
+  background: #4a536b;
+}
+
+.scroll-panel button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.scroll-panel button.primary {
+  background: var(--accent);
+  font-weight: 600;
+}
+
+.scroll-panel button.primary:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.scroll-error {
+  color: #fca5a5;
+  white-space: normal;
+  line-height: 1.4;
+}
+
+/* The self test's auto-scrolling driver page: tall, striped, unmistakable. */
+.scroll-driver {
+  min-height: 100%;
+  overflow: hidden;
+}
+
+.driver-row {
+  height: 80px;
+  display: grid;
+  place-items: center;
+  font: 600 22px/80px -apple-system, 'PingFang SC', sans-serif;
+  font-variant-numeric: tabular-nums;
 }

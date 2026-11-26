@@ -20,8 +20,8 @@ use objc2_core_graphics::{
 };
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString};
 use objc2_screen_capture_kit::{
-    SCCaptureResolutionType, SCContentFilter, SCDisplay, SCScreenshotManager, SCShareableContent,
-    SCStreamConfiguration,
+    SCCaptureResolutionType, SCContentFilter, SCDisplay, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
+    SCWindow,
 };
 
 use crate::clog;
@@ -299,6 +299,16 @@ fn capture_display(display: &SCDisplay, monitor: &MonitorInfo) -> Result<CFRetai
     unsafe {
         config.setWidth(monitor.pixel_width.max(1) as usize);
         config.setHeight(monitor.pixel_height.max(1) as usize);
+        configure_capture(&config);
+    }
+    shot(&filter, &config)
+}
+
+/// The configuration shared by every capture: cursor-free, sRGB, opaque, best
+/// resolution. Width/height (and the region) are set by the caller.
+fn configure_capture(config: &SCStreamConfiguration) {
+    // SAFETY: plain setters on a live `SCStreamConfiguration`.
+    unsafe {
         config.setShowsCursor(false);
         config.setPixelFormat(PIXEL_FORMAT_BGRA);
         // Convert from the display's color space (often Display P3) to sRGB so
@@ -308,7 +318,10 @@ fn capture_display(display: &SCDisplay, monitor: &MonitorInfo) -> Result<CFRetai
         config.setScalesToFit(false);
         config.setShouldBeOpaque(true);
     }
+}
 
+/// One screenshot through `SCScreenshotManager`, bridged to a synchronous call.
+fn shot(filter: &SCContentFilter, config: &SCStreamConfiguration) -> Result<CFRetained<CGImage>, String> {
     let (tx, rx) = mpsc::channel();
     let block = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
         let result = if image.is_null() {
@@ -325,12 +338,172 @@ fn capture_display(display: &SCDisplay, monitor: &MonitorInfo) -> Result<CFRetai
     });
     // SAFETY: as in `shareable_content`.
     unsafe {
-        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(&filter, &config, Some(&block))
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(filter, config, Some(&block))
     }
     let ptr = wait_ptr("截取屏幕", rx)?;
     let non_null = std::ptr::NonNull::new(ptr as *mut CGImage).expect("non-null image");
     // SAFETY: the pointer is the +1 reference retained in the handler.
     Ok(unsafe { CFRetained::from_raw(non_null) })
+}
+
+/// A per-session capture setup for the scroll capture: everything
+/// ScreenCaptureKit needs (shareable content, filter, configuration) is built
+/// once and each tick only runs the shot. On a 300 ms cadence the old
+/// one-shot path re-enumerated all shareable content every tick — the most
+/// expensive call in the chain — and rebuilt filter and config around it.
+///
+/// Holds Objective-C objects, so it is not `Send`: it must live on the thread
+/// that captures (the scroll loop's own thread, which is exactly the point).
+pub struct RegionCapturer {
+    region: IRect,
+    /// `true` = capture the whole display and crop, the geometry-correct
+    /// fallback for when `sourceRect` disagrees with reality.
+    full: bool,
+    filter: Retained<SCContentFilter>,
+    config: Retained<SCStreamConfiguration>,
+}
+
+impl RegionCapturer {
+    /// Find the display and build the (optionally window-excluding) filter.
+    fn build(monitor: &MonitorInfo, exclude: &[u32]) -> Result<(Retained<SCDisplay>, Retained<SCContentFilter>), String> {
+        let content = shareable_content()?;
+        // SAFETY: plain getters on the content returned by ScreenCaptureKit.
+        let displays = unsafe { content.displays() };
+        let display = unsafe {
+            (0..displays.count()).map(|i| displays.objectAtIndex(i)).find(|d| d.displayID() == monitor.id)
+        }
+        .ok_or_else(|| format!("显示器 {} 不可截取", monitor.id))?;
+        // SAFETY: plain getter on `content`.
+        let windows = unsafe { content.windows() };
+        let excluded: Retained<NSArray<SCWindow>> = if exclude.is_empty() {
+            NSArray::new()
+        } else {
+            let mut picked: Vec<Retained<SCWindow>> = Vec::new();
+            // SAFETY: plain getters on `content`.
+            for i in 0..windows.count() {
+                // SAFETY: plain getters on a window from `content`.
+                let window = unsafe {
+                    let window = windows.objectAtIndex(i);
+                    if exclude.contains(&window.windowID()) {
+                        Some(window)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(window) = window {
+                    picked.push(window);
+                }
+            }
+            let refs: Vec<&SCWindow> = picked.iter().map(|w| &**w).collect();
+            NSArray::from_slice(&refs)
+        };
+        // SAFETY: `alloc` is paired with `init`; both objects outlive the call.
+        let filter = unsafe {
+            SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &excluded)
+        };
+        // The filter keeps the display alive; the returned handle is for the
+        // full-display variant's config (and keeps a +1 for the caller).
+        Ok((display, filter))
+    }
+
+    /// Region capture through `sourceRect`, with our own on-screen windows
+    /// (`exclude`, the scroll outline and control panel) left out.
+    pub fn new_region(monitor: &MonitorInfo, region: &IRect, exclude: &[u32]) -> Result<Self, String> {
+        let (_display, filter) = Self::build(monitor, exclude)?;
+        // SAFETY: `new` is a plain Objective-C class method.
+        let config = unsafe { SCStreamConfiguration::new() };
+        let scale = monitor.scale.max(1.0);
+        // SAFETY: plain setters on a freshly created object.
+        unsafe {
+            // `sourceRect` is in points, relative to the display's origin;
+            // the output size is the region's pixel size, so no resampling.
+            config.setSourceRect(cg_rect(
+                region.x as f64 / scale,
+                region.y as f64 / scale,
+                region.w as f64 / scale,
+                region.h as f64 / scale,
+            ));
+            config.setWidth(region.w.max(1) as usize);
+            config.setHeight(region.h.max(1) as usize);
+            configure_capture(&config);
+        }
+        Ok(Self { region: *region, full: false, filter, config })
+    }
+
+    /// Whole-display capture cropped to `region`. Slower per tick, but its
+    /// geometry matches the frozen frames exactly.
+    pub fn new_full(monitor: &MonitorInfo, region: &IRect) -> Result<Self, String> {
+        let (_display, filter) = Self::build(monitor, &[])?;
+        // SAFETY: `new` is a plain Objective-C class method.
+        let config = unsafe { SCStreamConfiguration::new() };
+        // SAFETY: plain setters on a freshly created object.
+        unsafe {
+            config.setWidth(monitor.pixel_width.max(1) as usize);
+            config.setHeight(monitor.pixel_height.max(1) as usize);
+            configure_capture(&config);
+        }
+        Ok(Self { region: *region, full: true, filter, config })
+    }
+
+    /// One shot, cropped to the region.
+    ///
+    /// Must run off the main thread: it blocks while ScreenCaptureKit calls.
+    pub fn capture(&self) -> Result<(usize, usize, Vec<u8>), String> {
+        objc2::rc::autoreleasepool(|_| {
+            let image = shot(&self.filter, &self.config)?;
+            let (width, height, rgba) = image_to_rgba(&image)?;
+            let region = &self.region;
+            if self.full {
+                if (region.x + region.w) as usize > width || (region.y + region.h) as usize > height {
+                    return Err(format!(
+                        "区域 {}x{}+{}+{} 超出显示器 {}x{}",
+                        region.w, region.h, region.x, region.y, width, height
+                    ));
+                }
+                let mut out = vec![0u8; (region.w * region.h * 4) as usize];
+                for row in 0..region.h as usize {
+                    let src = (region.y as usize + row) * width * 4 + region.x as usize * 4;
+                    let dst = row * region.w as usize * 4;
+                    out[dst..dst + region.w as usize * 4].copy_from_slice(&rgba[src..src + region.w as usize * 4]);
+                }
+                Ok((region.w as usize, region.h as usize, out))
+            } else {
+                if (width, height) != (region.w as usize, region.h as usize) {
+                    // ScreenCaptureKit may adjust the rect; resample is worse
+                    // than a skipped tick, so surface it and let the caller
+                    // drop the frame.
+                    return Err(format!("区域截图返回 {width}x{height}，期望 {}x{}", region.w, region.h));
+                }
+                Ok((width, height, rgba))
+            }
+        })
+    }
+}
+
+/// Capture the whole display and crop `region` (display-local physical
+/// pixels) out of it — a one-shot helper for the scroll session's sourceRect
+/// sanity check. The steady-state loop uses [`RegionCapturer`].
+///
+/// Must run off the main thread: it blocks while ScreenCaptureKit calls back.
+pub fn capture_full_region_rgba(monitor: &MonitorInfo, region: &IRect) -> Result<(usize, usize, Vec<u8>), String> {
+    objc2::rc::autoreleasepool(|_| {
+        let (display, _filter) = RegionCapturer::build(monitor, &[])?;
+        let image = capture_display(&display, monitor)?;
+        let (width, height, rgba) = image_to_rgba(&image)?;
+        if (region.x + region.w) as usize > width || (region.y + region.h) as usize > height {
+            return Err(format!(
+                "区域 {}x{}+{}+{} 超出显示器 {}x{}",
+                region.w, region.h, region.x, region.y, width, height
+            ));
+        }
+        let mut out = vec![0u8; (region.w * region.h * 4) as usize];
+        for row in 0..region.h as usize {
+            let src = (region.y as usize + row) * width * 4 + region.x as usize * 4;
+            let dst = row * region.w as usize * 4;
+            out[dst..dst + region.w as usize * 4].copy_from_slice(&rgba[src..src + region.w as usize * 4]);
+        }
+        Ok((region.w as usize, region.h as usize, out))
+    })
 }
 
 /// Copy a 32-bit CGImage into a plain RGBA8 buffer.
@@ -496,11 +669,71 @@ pub fn rgba_to_image(rgba: &[u8], width: u32, height: u32) -> Option<CFRetained<
 }
 
 /// Decode a PNG file into RGBA8.
+///
+/// Every caller feeds it PNGs this app encoded itself (annotation layers,
+/// debug dumps), so the strict 8-bit-per-channel paths cover reality; anything
+/// exotic is refused rather than half-converted.
 pub fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
-    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).map_err(|e| e.to_string())?;
-    let rgba = img.into_rgba8();
-    let (w, h) = rgba.dimensions();
-    Ok((w, h, rgba.into_raw()))
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().map_err(|e| format!("PNG 解码失败：{e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut buf).map_err(|e| format!("PNG 解码失败：{e}"))?;
+    let (w, h) = (info.width, info.height);
+    let len = w as usize * h as usize * 4;
+    let rgba = match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => buf[..len].to_vec(),
+        (png::ColorType::Rgb, png::BitDepth::Eight) => {
+            let mut out = Vec::with_capacity(len);
+            for px in buf[..w as usize * h as usize * 3].chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            out
+        }
+        (png::ColorType::Grayscale, png::BitDepth::Eight) => buf[..w as usize * h as usize]
+            .iter()
+            .flat_map(|&g| [g, g, g, 255])
+            .collect(),
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
+            let mut out = Vec::with_capacity(len);
+            for px in buf[..w as usize * h as usize * 2].chunks_exact(2) {
+                out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+            out
+        }
+        _ => return Err(format!("不支持的 PNG 格式：{:?} / {:?}", info.color_type, info.bit_depth)),
+    };
+    Ok((w, h, rgba))
+}
+
+/// Alpha-composite a transparent annotation layer over an opaque screenshot
+/// crop (both RGBA8, identical dimensions), with straight src-over maths:
+/// out = over·a + base·(1−a). The web layer renders the annotations, so the
+/// pixels the user drew are exactly the pixels that get copied or saved.
+///
+/// An opaque layer (the mosaic tool pastes real pixels in) simply replaces the
+/// crop, which is what "drawn on top" should mean there too.
+pub fn composite_overlay(base: &[u8], over: &[u8]) -> Result<Vec<u8>, String> {
+    if base.len() != over.len() {
+        return Err(format!("标注图层与截图尺寸不匹配（{} vs {} 字节）", over.len(), base.len()));
+    }
+    let mut out = base.to_vec();
+    for (dst, src) in out.chunks_exact_mut(4).zip(over.chunks_exact(4)) {
+        let a = src[3] as u32;
+        if a == 0 {
+            continue;
+        }
+        if a == 255 {
+            dst.copy_from_slice(src);
+            continue;
+        }
+        for c in 0..3 {
+            let blended = src[c] as u32 * a + dst[c] as u32 * (255 - a) + 127;
+            dst[c] = (blended / 255) as u8;
+        }
+        // The base is opaque, so the result stays opaque.
+    }
+    Ok(out)
 }
 
 /// Shrink RGBA8 by an integer factor with box averaging (for previews).
@@ -755,5 +988,21 @@ mod tests {
         assert_eq!((w, h), (2, 1));
         // Top-left 2x2 block, channel 0: 0, 4, 16, 20 → mean 10.
         assert_eq!(out[0], 10);
+    }
+
+    #[test]
+    fn annotation_composite_blends_by_alpha() {
+        let base = [10, 20, 30, 255, 200, 150, 100, 255, 1, 2, 3, 255];
+        // One fully transparent pixel (base shows through), one opaque
+        // (annotation replaces), then a half-transparent one below.
+        let over = [0, 0, 0, 0, 255, 0, 0, 255, 90, 90, 90, 128];
+        // Length mismatch is an error, not a panic.
+        assert!(composite_overlay(&base, &over[..4]).is_err());
+        let out = composite_overlay(&base, &over).unwrap();
+        assert_eq!(&out[0..4], &[10, 20, 30, 255]); // transparent keeps the base
+        assert_eq!(&out[4..8], &[255, 0, 0, 255]); // opaque replaces it
+        // 90·128/255 + 1·127/255 + rounding ≈ 45.
+        assert_eq!(out[8], ((90 * 128 + 1 * 127 + 127) / 255) as u8);
+        assert_eq!(out[11], 255);
     }
 }

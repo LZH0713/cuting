@@ -73,7 +73,11 @@ export function ResultWindow() {
         </section>
         <section className="texts">
           <div className="row">
-            <span className="muted">{item ? `${item.lines.length} 行 · ${item.elapsedMs} ms` : ''}</span>
+            <span className="muted">
+              {item
+                ? `${item.lines.length} 行 · ${item.elapsedMs} ms${item.degraded ? ' · 已降级识别（系统识别服务不稳定）' : ''}`
+                : ''}
+            </span>
             <span className="grow" />
             <select value={target} onChange={(e) => setTarget(e.target.value)} disabled={!item} title="目标语言">
               {langs.map((l) => (

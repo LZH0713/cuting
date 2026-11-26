@@ -92,6 +92,8 @@ export interface ResultPayload {
   text: string;
   lines: OcrLine[];
   elapsedMs: number;
+  /** True when the accurate pipeline hung and only the fast fallback answered. */
+  degraded?: boolean;
 }
 
 /** What the release feed offers, if anything. */
@@ -108,14 +110,23 @@ export interface Translation {
   elapsedMs: number;
 }
 
-export type WindowKind = { kind: 'overlay'; monitorId: number } | { kind: 'result' } | { kind: 'settings' };
+export type WindowKind =
+  | { kind: 'overlay'; monitorId: number }
+  | { kind: 'result' }
+  | { kind: 'settings' }
+  | { kind: 'scroll-panel' }
+  | { kind: 'scroll-outline' }
+  | { kind: 'scroll-driver' };
 
-/** The window label decides what a page renders: `overlay-<displayId>`, `result` or `settings`. */
+/** The window label decides what a page renders: `overlay-<displayId>`, `result`, `settings` or the `scroll-*` helpers. */
 export function detectWindow(): WindowKind {
   const label = getCurrentWebviewWindow().label;
   if (label.startsWith('overlay-')) {
     return { kind: 'overlay', monitorId: Number(label.slice('overlay-'.length)) };
   }
+  if (label === 'scroll-panel') return { kind: 'scroll-panel' };
+  if (label === 'scroll-outline') return { kind: 'scroll-outline' };
+  if (label === 'scroll-driver') return { kind: 'scroll-driver' };
   return label === 'result' ? { kind: 'result' } : { kind: 'settings' };
 }
 

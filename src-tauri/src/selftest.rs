@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use block2::RcBlock;
@@ -27,7 +27,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::capture::{self, Frame, IRect};
 use crate::clog;
-use crate::geo::MonitorInfo;
+use crate::geo::{MonitorInfo, Rect};
 use crate::overlay::{self, Mode};
 use crate::util::lock;
 
@@ -52,9 +52,14 @@ pub fn run(app: AppHandle) {
     });
     std::thread::spawn(move || {
         // `CUTING_SELFTEST_SCOPE=settings` runs the settings checks only, in a
-        // hidden window: nothing appears on screen.
+        // hidden window: nothing appears on screen. `…=scroll` drives a real
+        // long-screenshot session against an auto-scrolling window of our own.
         let scope = std::env::var("CUTING_SELFTEST_SCOPE").unwrap_or_default();
-        let summary = if scope == "settings" { drive_settings(&app, &out) } else { drive(&app, &out) };
+        let summary = match scope.as_str() {
+            "settings" => drive_settings(&app, &out),
+            "scroll" => drive_scroll(&app),
+            _ => drive(&app, &out),
+        };
         let _ = std::fs::write(out.join("summary.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
         clog!("selftest finished: {}", summary["verdict"]);
         let quit = app.clone();
@@ -501,10 +506,10 @@ fn drive(app: &AppHandle, out: &Path) -> Value {
         json!({ "expected": { "x": 400, "y": 380, "w": 700, "h": 320 } }),
     );
     let buttons = page.as_ref().ok().and_then(|p| p["buttons"].as_array()).cloned().unwrap_or_default();
-    let toolbar_ok = page.as_ref().is_ok_and(|p| p["toolbar"]["display"].as_str() == Some("flex")) && buttons.len() == 6;
+    let toolbar_ok = page.as_ref().is_ok_and(|p| p["toolbar"]["display"].as_str() == Some("flex")) && buttons.len() == 8;
     let toolbar = page.as_ref().map(|p| p["toolbar"].clone()).unwrap_or(Value::Null);
     rec.step(
-        "toolbar shows six buttons",
+        "toolbar shows eight buttons",
         page.clone().and_then(|p| if toolbar_ok { Ok(p["buttons"].clone()) } else { Err(format!("toolbar is {toolbar}")) }),
         toolbar,
     );
@@ -753,6 +758,181 @@ const NETWORK_CHECKS: &str = r#"(async () => {
   }).then(() => 'accepted', (e) => String(e));
   return JSON.stringify({ ports, dead, system, malformed, bare });
 })()"#;
+
+/// Drive a real long-screenshot session: capture the screen for the frozen
+/// frames, park the auto-scrolling driver window over the region, start the
+/// scroll capture, and watch the stitched height grow. Needs screen-recording
+/// permission (the loop captures the real screen).
+///
+/// `CUTING_SCROLL_RECT="x,y,w,h"` picks the region (main-display CSS); the
+/// driver page jumps 150 px every second for ~12 s.
+fn drive_scroll(app: &AppHandle) -> Value {
+    let step = |name: &str, ok: bool, detail: Value| {
+        clog!("[selftest] {} {}: {}", if ok { "ok" } else { "FAILED" }, name, detail);
+        (name.to_string(), ok, detail)
+    };
+    let mut steps: Vec<Value> = Vec::new();
+
+    // The region: main-display CSS. Default comfortably inside any screen.
+    let (rx, ry, rw, rh) = match std::env::var("CUTING_SCROLL_RECT") {
+        Ok(s) => {
+            let v: Vec<f64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+            (v.first().copied().unwrap_or(200.0), v.get(1).copied().unwrap_or(200.0), v.get(2).copied().unwrap_or(900.0), v.get(3).copied().unwrap_or(700.0))
+        }
+        Err(_) => (200.0, 200.0, 900.0, 700.0),
+    };
+
+    let monitors = capture::active_displays();
+    let Some(main) = monitors.first().cloned() else {
+        let (n, ok, d) = step("displays", false, Value::Null);
+        steps.push(json!({ "step": n, "ok": ok, "detail": d }));
+        return json!({ "scope": "scroll", "verdict": "FAIL", "steps": steps });
+    };
+    let local = Rect::new(rx, ry, rw, rh);
+    let global = Rect::new(main.rect.x + rx, main.rect.y + ry, rw, rh);
+
+    // 1. Real capture (same as a hotkey press). When screen recording is not
+    //    granted for this launch, fall back to synthetic frames: the loop
+    //    plays them back, so the stitch + finish pipeline is still exercised
+    //    end-to-end, deterministically and without any permission.
+    let own_pid = std::process::id() as i32;
+    let real = capture::capture_all(&monitors, own_pid);
+    let mut test_frames: Option<Arc<Vec<(usize, usize, Vec<u8>)>>> = None;
+    let frames = match real {
+        Ok(frames) if !frames.is_empty() => {
+            // 1. Park the driver window on the region BEFORE capturing, so
+            //    the frozen first frame already shows the page's top.
+            let _driver = on_main(app, move |app| crate::scroll::ensure_driver_window(app, &global));
+            pause(1500); // page load + first paint
+            match capture::capture_all(&monitors, own_pid) {
+                Ok(frames2) if !frames2.is_empty() => frames2,
+                _ => frames,
+            }
+        }
+        _ => {
+            let scale = main.scale.max(1.0);
+            let (pw, ph) = ((rw * scale).round() as usize, (rh * scale).round() as usize);
+            let display_w = main.pixel_width as usize;
+            let display_h = main.pixel_height as usize;
+            let region_x = (rx * scale).round() as usize;
+            let region_y = (ry * scale).round() as usize;
+            // UI-like page: a textured band (60 px) over solid padding, with a
+            // 320 px period — flat bottoms included, the case that once broke
+            // real sessions.
+            let page = |x: usize, y: usize| -> [u8; 4] {
+                if y % 320 < 60 {
+                    let v = ((x * 31 + y * 17) % 251) as u8;
+                    [v, ((v as usize * 3) % 251) as u8, ((v as usize * 7) % 251) as u8, 255]
+                } else {
+                    [250, 250, 250, 255]
+                }
+            };
+            // Full-display synthetic frame: pattern inside the region, dark
+            // elsewhere.
+            let mut full = vec![26u8; display_w * display_h * 4];
+            for r in 0..ph {
+                let row = (region_y + r) * display_w + region_x;
+                for c in 0..pw {
+                    let px = page(c, region_y + r - region_y);
+                    let i = (row + c) * 4;
+                    full[i..i + 4].copy_from_slice(&px);
+                }
+            }
+            // Playback frames: the region's page scrolled by 300 px per step,
+            // each frame duplicated so the settle check sees two identical
+            // consecutive ticks per scroll step.
+            let steps = 12usize;
+            let step_px = 300usize;
+            let mut frames: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+            for k in 1..=steps {
+                let mut f = vec![0u8; pw * ph * 4];
+                for r in 0..ph {
+                    for c in 0..pw {
+                        let px = page(c, k * step_px + r);
+                        let i = (r * pw + c) * 4;
+                        f[i..i + 4].copy_from_slice(&px);
+                    }
+                }
+                frames.push((pw, ph, f.clone()));
+                frames.push((pw, ph, f));
+            }
+            test_frames = Some(Arc::new(frames));
+            clog!("[selftest] no screen recording permission; using synthetic playback frames");
+            vec![Frame::from_rgba(
+                MonitorInfo {
+                    id: main.id,
+                    rect: main.rect,
+                    scale: main.scale,
+                    pixel_width: display_w as u32,
+                    pixel_height: display_h as u32,
+                    is_main: true,
+                },
+                display_w,
+                display_h,
+                full,
+            )]
+        }
+    };
+    {
+        let frames = frames.clone();
+        let _ = on_main(app, move |app| {
+            overlay::present_for_test(app, Mode::Shot, frames);
+        });
+    }
+    pause(400);
+    let (n, ok, d) = step("capture", true, json!({ "displays": frames.len(), "playback": test_frames.is_some() }));
+    steps.push(json!({ "step": n, "ok": ok, "detail": d }));
+
+    // 2. Start the scroll session on the region (the toolbar button's path).
+    let label = format!("overlay-{}", main.id);
+    let started = {
+        let local = local.clone();
+        on_main(app, move |app| crate::scroll::start(app, &label, &local, test_frames))
+    };
+    let (n, ok, d) = step("start", started.is_ok(), json!(started.err().unwrap_or_default()));
+    steps.push(json!({ "step": n, "ok": ok, "detail": d }));
+
+    // 4. Let the driver page scroll itself; watch the stitched height grow.
+    let initial = crate::scroll::progress(app).map(|p| p.height_px).unwrap_or(0);
+    let mut samples: Vec<u64> = vec![initial as u64];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(22);
+    while std::time::Instant::now() < deadline {
+        pause(500);
+        let h = crate::scroll::progress(app).map(|p| p.height_px).unwrap_or(initial);
+        if samples.last() != Some(&(h as u64)) {
+            samples.push(h as u64);
+        }
+    }
+    let final_height = crate::scroll::progress(app).map(|p| p.height_px).unwrap_or(initial);
+    let grew_by = final_height as i64 - initial as i64;
+    let grew_ok = grew_by >= 450; // ≥3 of the driver's 150 px jumps made it in
+    let (n, ok, d) = step(
+        "stitch grows",
+        grew_ok,
+        json!({ "initial": initial, "final": final_height, "grewBy": grew_by, "samples": samples }),
+    );
+    steps.push(json!({ "step": n, "ok": ok, "detail": d }));
+
+    // 5. Finish through the clipboard path (the panel's 复制 button), which is
+    //    the strongest regression we have for the end-of-session code, then
+    //    leave everything as it was.
+    let copied = crate::scroll::copy(app);
+    let (n, ok, d) = step("copy", copied.is_ok(), json!(copied.err().unwrap_or_default()));
+    steps.push(json!({ "step": n, "ok": ok, "detail": d }));
+    crate::scroll::cancel(app);
+    let _ = on_main(app, |app| {
+        if let Some(window) = app.get_webview_window(crate::scroll::DRIVER_LABEL) {
+            if let Some(ns) = crate::overlay::ns_window(&window) {
+                ns.orderOut(None);
+            }
+        }
+    });
+    let (n, ok, d) = step("cleanup", true, json!({ "cancelled": true }));
+    steps.push(json!({ "step": n, "ok": ok, "detail": d }));
+
+    let ok = steps.iter().all(|s| s["ok"].as_bool() == Some(true));
+    json!({ "scope": "scroll", "verdict": if ok { "PASS" } else { "FAIL" }, "steps": steps })
+}
 
 fn drive_settings(app: &AppHandle, _out: &Path) -> Value {
     let mut rec = Recorder::default();
