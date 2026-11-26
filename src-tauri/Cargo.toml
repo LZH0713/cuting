@@ -17,6 +17,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# Tauri v2 模板必备：generate_context! 用本包的 `custom-protocol` feature
+# 判断「非 dev」，开了才会把 frontendDist 嵌入二进制；不开则页面去连
+# devUrl（localhost:1420），release 包页面永远加载不出（Ctrl+A 后无法画框）。
+# 设为默认，让任何构建路径（cargo build / tauri build / CI）都不会踩空；
+# `tauri dev` 时 CLI 会自动过滤掉它（--no-default-features），不受影响。
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = ["image-png", "macos-private-api", "tray-icon"] }
 tauri-plugin-opener = "2"
