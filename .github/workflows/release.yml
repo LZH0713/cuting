@@ -74,12 +74,15 @@ jobs:
           mkdir -p release
           cp -R src-tauri/target/release/bundle/macos/Cuting.app release/
           ditto -c -k --sequesterRsrc --keepParent release/Cuting.app release/Cuting-macOS-arm64.zip
+          # 更新说明取自 annotated tag 的 message（`git tag -a vX.Y.Z -m "更新说明"`）；
+          # 轻量 tag（没有 message）退化为指向 commit 的 message。
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" | sed '/^[[:space:]]*$/d' > release/notes.txt
           # On macOS the updater artifacts land next to the .app bundle.
           if ls src-tauri/target/release/bundle/macos/*.app.tar.gz >/dev/null 2>&1; then
             cp src-tauri/target/release/bundle/macos/Cuting.app.tar.gz release/
             cp src-tauri/target/release/bundle/macos/Cuting.app.tar.gz.sig release/
             URL="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/Cuting.app.tar.gz"
-            jq -n --arg version "$VERSION" --arg url "$URL" --rawfile sig release/Cuting.app.tar.gz.sig --arg notes "$(git log -1 --pretty=%B | sed '/^\s*$/d' | head -n 5)" \
+            jq -n --arg version "$VERSION" --arg url "$URL" --rawfile sig release/Cuting.app.tar.gz.sig --rawfile notes release/notes.txt \
               '{version: $version, notes: $notes, pub_date: (now | todateiso8601), platforms: { "darwin-aarch64": { signature: $sig, url: $url } } }' > release/latest.json
             cat release/latest.json
           else
@@ -92,4 +95,4 @@ jobs:
         run: |
           FILES=(release/Cuting-macOS-arm64.zip)
           [ -f release/latest.json ] && FILES+=(release/latest.json release/Cuting.app.tar.gz release/Cuting.app.tar.gz.sig)
-          gh release create "$GITHUB_REF_NAME" --title "Cuting $GITHUB_REF_NAME" --generate-notes "${FILES[@]}"
+          gh release create "$GITHUB_REF_NAME" --title "Cuting $GITHUB_REF_NAME" --notes-file release/notes.txt "${FILES[@]}"
